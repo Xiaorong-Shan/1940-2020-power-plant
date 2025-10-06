@@ -160,13 +160,52 @@ match_tbl_all <- rbindlist(lapply(YEARS, function(yr) {
 
 
 # ======================= STEP D ============================
+# Append per-ton HYADS at the plant location (nearest grid cell)
+# ===========================================================
+
+# 1) Project plant lon/lat to the HyADS CRS (Albers) to get plant_x/plant_y
+pl_all_sf  <- st_as_sf(match_tbl_all, coords = c("plant_lon","plant_lat"), crs = 4326, remove = FALSE)
+pl_all_alb <- st_transform(pl_all_sf, P4S_ALBERS)
+pl_xy      <- st_coordinates(pl_all_alb)
+
+mt <- as.data.table(match_tbl_all)
+mt[, `:=`(plant_x = pl_xy[,1], plant_y = pl_xy[,2])]
+
+# 2) Prep HyADS grid (only needed cols; ensure character uID)
+hc <- hyads_clean[, .(uID = as.character(uID), x, y, hyads)]
+
+# 3) For each row: within its matched uID, find nearest (x,y) and fetch hyads
+mt[, `:=`(hyads_at_plant = NA_real_, grid_x = NA_real_, grid_y = NA_real_)]
+uids_needed <- unique(mt$hyads_uID_nn)
+
+for (uid in uids_needed) {
+  sub <- hc[uID == uid]
+  idx <- which(mt$hyads_uID_nn == uid)
+  if (nrow(sub) == 0L || length(idx) == 0L) next
+  # per row, pick nearest grid cell
+  for (i in idx) {
+    d2 <- (sub$x - mt$plant_x[i])^2 + (sub$y - mt$plant_y[i])^2
+    j  <- which.min(d2)
+    mt$hyads_at_plant[i] <- sub$hyads[j]
+    mt$grid_x[i]         <- sub$x[j]
+    mt$grid_y[i]         <- sub$y[j]
+  }
+}
+
+# 4) Replace the master table
+match_tbl_all <- mt[]
+
+# ======================= STEP E ============================
 # Final preview & (optional) write
 # ===========================================================
 
 cat("\n================ FINAL PREVIEW (top 10) ================\n")
 print(match_tbl_all[order(year, nn_dist_km)][1:min(10, .N),
       .(year, plant_id, `Plant Name`, hyads_uID_nn, nn_dist_km,
-        hyads_peak, hyads_sum, plant_lon, plant_lat, src_lon, src_lat)])
+        hyads_at_plant,  # <-- per-ton hyads at plant location
+        hyads_peak, hyads_sum,
+        plant_lon, plant_lat, src_lon, src_lat,
+        grid_x, grid_y)])
 
 cat("\nRows in final table:", nrow(match_tbl_all), "\n")
 cat("Years covered:", paste(sort(unique(match_tbl_all$year)), collapse = ", "), "\n")
