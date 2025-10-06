@@ -211,4 +211,4 @@ cat("\nRows in final table:", nrow(match_tbl_all), "\n")
 cat("Years covered:", paste(sort(unique(match_tbl_all$year)), collapse = ", "), "\n")
 
 # Optional: write to CSV
-data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv")
+data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv") 
