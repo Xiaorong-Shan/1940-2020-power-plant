@@ -211,4 +211,46 @@ cat("\nRows in final table:", nrow(match_tbl_all), "\n")
 cat("Years covered:", paste(sort(unique(match_tbl_all$year)), collapse = ", "), "\n")
 
 # Optional: write to CSV
-data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv") 
+data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv")
+
+# ======================= STEP F (FINAL) ====================
+# Produce by-unit FSTs for 1940–1990 with the exact 2022 schema: x, y, uID, hyads
+# Logic per year: identify active uIDs; keep their per-ton hyads, set all others to 0.
+# ===========================================================
+
+OUT_DIR <- "/scratch/xshan2/R_Code/disperseR/byunit_fst"
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Base table from 2022 by-unit; enforce required columns and types
+req_cols <- c("x","y","uID","hyads")
+stopifnot(all(req_cols %in% names(hyads_clean)))
+
+hc <- hyads_clean[, .(
+  x     = as.numeric(x),
+  y     = as.numeric(y),
+  uID   = as.character(uID),
+  hyads = as.numeric(hyads)
+)]
+
+# 2) Build per-year active uID list from the plant–uID matches (remove NAs)
+valid_rows  <- match_tbl_all[!is.na(year) & !is.na(hyads_uID_nn)]
+uid_by_year <- valid_rows[, .(uID = unique(as.character(hyads_uID_nn))), by = year]
+
+# 3) Write one FST per target year (uses global YEARS; missing years → all zeros)
+years_to_write  <- YEARS
+all_uids_total  <- uniqueN(hc$uID)
+
+for (yr in years_to_write) {
+  active_uids <- uid_by_year[year == yr, uID]
+
+  hy_y <- copy(hc)  # same rows as 2022
+  # keep per-ton for active uIDs; zero out others
+  hy_y[, hyads := fifelse(uID %in% active_uids, hyads, 0)]
+
+  out_fst <- file.path(OUT_DIR, sprintf("grids_exposures_byunit_%d.fst", yr))
+  fst::write_fst(hy_y, out_fst, compress = 50)
+
+  cat(sprintf("Year %d done: %d active of %d total uID\n",
+              yr, length(active_uids), all_uids_total))
+}
+
