@@ -49,14 +49,20 @@ EF_SO2 <- subset_after_1940 %>%
       grepl("wood|biomass", Primary.Fuel.Type, ignore.case = TRUE) ~ "Biomass",
       TRUE ~ "Other"
     ),
-    Unit.Type = gsub("\\s*\\(.*?\\)", "", Unit.Type),
+    Unit.Type = gsub("\\s*\\(.*?\\)", "", Unit.Type),  # Clean Unit.Type
     scrubber = ifelse(grepl("scrubber|FGD", SO2.Controls, ignore.case = TRUE), 1, 0),
     log_Gen_kWh = log10(Gross.Load..MWh. * 1000 + 1),
     SO2_grams = SO2.Mass..short.tons. * 907185,
+    log_SO2_grams = log10(SO2_grams + 1),
     EF = SO2_grams / (Gross.Load..MWh. * 1000),
-    log_EF = log10(EF + 1)
+    log_EF = log10(EF + 1),
+    Decade = paste0(floor(Year / 10) * 10, "s"),
+    Region = NERC.Region,
+    status = ifelse(grepl("Operating", Operating.Status, ignore.case = TRUE), 1, 0),
+    Fuel_Unit_Interaction = paste0(convert_fuel, "_", Unit.Type)
   ) %>%
-  filter(EF < 10)
+  filter(EF < 10)  # Optional: remove extreme outliers
+
 
 # ===============================================================
 # 4. Split data into training and testing sets
