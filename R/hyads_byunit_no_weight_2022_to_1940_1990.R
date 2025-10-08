@@ -285,41 +285,37 @@ for (yr in years_to_write) {
               yr, length(active_uids), all_uids_total))
 }
 
-# ======================= STEP G ===========================
-# Compute total HyADS exposure fields by year
-# total = sum_over_uID(hyads_per_ton * emissions_tons)
-# ===========================================================
+# ======================= STEP G (no_weight) ===========================
+# Make TOTAL exposure FSTs from your per-ton by-unit FSTs.
+# Input (per-ton, no_weight):  /scratch/xshan2/R_Code/disperseR/byunit_fst/grids_exposures_byunit_{YEAR}.fst
+# Output (no_weight total):    /scratch/xshan2/R_Code/disperseR/total_fst/grids_exposures_total_{YEAR}.fst
+# Schema of output: x, y, hyads  (same grid, summed across all uIDs)
+# =====================================================================
 
-library(fst)
-library(data.table)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fst)
+})
 
 YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
 
+# Your scratch paths
+BYUNIT_DIR <- "/scratch/xshan2/R_Code/disperseR/byunit_fst"   # from Step F
+OUT_DIR    <- "/scratch/xshan2/R_Code/disperseR/total_fst"    # new folder for totals
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
 for (yr in YEARS) {
+  byunit_path <- file.path(BYUNIT_DIR, sprintf("grids_exposures_byunit_%d.fst", yr))
+  total_path  <- file.path(OUT_DIR,    sprintf("grids_exposures_total_%d.fst",   yr))
 
-  byunit_path <- sprintf("/scratch/xshan2/R_Code/disperseR/byunit_fst/grids_exposures_byunit_%d.fst", yr)
-  emiss_path  <- sprintf("/scratch/xshan2/R_Code/disperseR/emission_tons_%d.csv", yr)
-  out_path    <- sprintf("/scratch/xshan2/R_Code/disperseR/total_exposure_%d.csv", yr)
+  # 1) Read per-ton by-unit (x, y, uID, hyads)
+  bu <- fst::read_fst(byunit_path, as.data.table = TRUE)
+  stopifnot(all(c("x","y","uID","hyads") %in% names(bu)))
 
-  # 1. Read by-unit per-ton field
-  byunit <- fst::read_fst(byunit_path, as.data.table = TRUE)
-  byunit[, uID := as.character(uID)]
+  # 2) Sum across uIDs at each grid cell (no-weight total)
+  total_field <- bu[, .(hyads = sum(hyads, na.rm = TRUE)), by = .(x, y)]
 
-  # 2. Read emission data (must have uID, tons)
-  emiss <- fread(emiss_path)
-  emiss[, uID := as.character(uID)]
-
-  # 3. Join and multiply
-  setkey(byunit, uID)
-  setkey(emiss, uID)
-  dt <- emiss[byunit]
-  dt[is.na(tons), tons := 0]
-  dt[, total := hyads * tons]
-
-  # 4. Aggregate by grid cell
-  total_field <- dt[, .(total_hyads = sum(total, na.rm = TRUE)), by = .(x, y)]
-
-  # 5. Save output
-  fwrite(total_field, out_path)
-  cat(sprintf("✅ Year %d complete — %d grid cells written.\n", yr, nrow(total_field)))
+  # 3) Write total (schema: x, y, hyads)
+  fst::write_fst(total_field[, .(x, y, hyads)], total_path, compress = 50)
+  cat(sprintf("✅ %d → %s (%d grid cells)\n", yr, total_path, nrow(total_field)))
 }
