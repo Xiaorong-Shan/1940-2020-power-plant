@@ -286,11 +286,11 @@ for (yr in years_to_write) {
 }
 
 # ======================= STEP G (no_weight) ===========================
-# Make TOTAL exposure FSTs from your per-ton by-unit FSTs.
-# Input (per-ton, no_weight):  /scratch/xshan2/R_Code/disperseR/byunit_fst/grids_exposures_byunit_{YEAR}.fst
-# Output (no_weight total):    /scratch/xshan2/R_Code/disperseR/total_fst/grids_exposures_total_{YEAR}.fst
-# Schema of output: x, y, hyads  (same grid, summed across all uIDs)
-# =====================================================================
+# Produce TOTAL exposure FSTs identical in structure to PI's outputs:
+# columns: x, y, hyads, year.E, year.D
+# Each file sums across all uIDs (no weighting).
+# Output: /scratch/xshan2/R_Code/disperseR/total_fst/grids_exposures_total_{YEAR}.fst
+# ================================================================================
 
 suppressPackageStartupMessages({
   library(data.table)
@@ -299,7 +299,6 @@ suppressPackageStartupMessages({
 
 YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
 
-# Your scratch paths
 BYUNIT_DIR <- "/scratch/xshan2/R_Code/disperseR/byunit_fst"   # from Step F
 OUT_DIR    <- "/scratch/xshan2/R_Code/disperseR/total_fst"    # new folder for totals
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -308,14 +307,18 @@ for (yr in YEARS) {
   byunit_path <- file.path(BYUNIT_DIR, sprintf("grids_exposures_byunit_%d.fst", yr))
   total_path  <- file.path(OUT_DIR,    sprintf("grids_exposures_total_%d.fst",   yr))
 
-  # 1) Read per-ton by-unit (x, y, uID, hyads)
+  # 1) Read by-unit file (per-ton, no_weight)
   bu <- fst::read_fst(byunit_path, as.data.table = TRUE)
   stopifnot(all(c("x","y","uID","hyads") %in% names(bu)))
 
-  # 2) Sum across uIDs at each grid cell (no-weight total)
+  # 2) Sum across all uIDs at each grid cell
   total_field <- bu[, .(hyads = sum(hyads, na.rm = TRUE)), by = .(x, y)]
 
-  # 3) Write total (schema: x, y, hyads)
-  fst::write_fst(total_field[, .(x, y, hyads)], total_path, compress = 50)
+  # 3) Add year columns (same as PI: both year.E and year.D = simulation year)
+  total_field[, `:=`(year.E = yr, year.D = yr)]
+
+  # 4) Write output with identical schema and column order
+  fst::write_fst(total_field[, .(x, y, hyads, year.E, year.D)], total_path, compress = 50)
+
   cat(sprintf("✅ %d → %s (%d grid cells)\n", yr, total_path, nrow(total_field)))
 }
