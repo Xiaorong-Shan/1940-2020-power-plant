@@ -237,6 +237,7 @@ for (yr in target_years) {
 # 12. Combine all decades and save results
 # ===============================================================
 combined_facility <- data.table::rbindlist(results_facility, use.names = TRUE, fill = TRUE)
+OUT_DIR = "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/03_powerplant/data/pp_emissions_1940_1990"
 out_csv <- file.path(OUT_DIR, "so2_facility_emissions_1940_1990.csv")
 data.table::fwrite(combined_facility, out_csv)
 message("Wrote combined facility CSV: ", out_csv, " (rows: ", nrow(combined_facility), ")")
