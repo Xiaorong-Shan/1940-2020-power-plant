@@ -244,7 +244,7 @@ print(summary(match_tbl_all$shift_dy_m / 1000))
 # Optional: write to CSV
 data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv")
 
-# ======================= STEP F (FINAL) ====================
+# ======================= STEP F  ===========================
 # Produce by-unit FSTs for 1940–1990 with the exact 2022 schema: x, y, uID, hyads
 # Logic per year: identify active uIDs; keep their per-ton hyads, set all others to 0.
 # ===========================================================
@@ -285,3 +285,41 @@ for (yr in years_to_write) {
               yr, length(active_uids), all_uids_total))
 }
 
+# ======================= STEP G ===========================
+# Compute total HyADS exposure fields by year
+# total = sum_over_uID(hyads_per_ton * emissions_tons)
+# ===========================================================
+
+library(fst)
+library(data.table)
+
+YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
+
+for (yr in YEARS) {
+
+  byunit_path <- sprintf("/scratch/xshan2/R_Code/disperseR/byunit_fst/grids_exposures_byunit_%d.fst", yr)
+  emiss_path  <- sprintf("/scratch/xshan2/R_Code/disperseR/emission_tons_%d.csv", yr)
+  out_path    <- sprintf("/scratch/xshan2/R_Code/disperseR/total_exposure_%d.csv", yr)
+
+  # 1. Read by-unit per-ton field
+  byunit <- fst::read_fst(byunit_path, as.data.table = TRUE)
+  byunit[, uID := as.character(uID)]
+
+  # 2. Read emission data (must have uID, tons)
+  emiss <- fread(emiss_path)
+  emiss[, uID := as.character(uID)]
+
+  # 3. Join and multiply
+  setkey(byunit, uID)
+  setkey(emiss, uID)
+  dt <- emiss[byunit]
+  dt[is.na(tons), tons := 0]
+  dt[, total := hyads * tons]
+
+  # 4. Aggregate by grid cell
+  total_field <- dt[, .(total_hyads = sum(total, na.rm = TRUE)), by = .(x, y)]
+
+  # 5. Save output
+  fwrite(total_field, out_path)
+  cat(sprintf("✅ Year %d complete — %d grid cells written.\n", yr, nrow(total_field)))
+}
