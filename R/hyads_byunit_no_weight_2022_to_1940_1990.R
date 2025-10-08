@@ -3,7 +3,7 @@
 # Output: one tidy table with year, plant info, plant lon/lat,
 #         nearest HyADS uID, distance (km), hyads_peak, hyads_sum,
 #         and HyADS source lon/lat.
-# Author: You
+# Author: Xiaorong Shan
 # Dependencies: data.table, readxl, fst, sf
 ###############################################################
 
@@ -131,22 +131,27 @@ match_tbl_all <- rbindlist(lapply(YEARS, function(yr) {
 
   # assemble tidy mapping with lon/lat & year
   out <- cbind(
-    data.table(
-      year       = yr,
-      plant_id   = plants_yr$plant_id,
-      `Plant Name`  = plants_yr$`Plant Name`,
-      `Plant State` = plants_yr$`Plant State`,
-      County        = plants_yr$County,
-      plant_lon  = plants_yr$Longitude,
-      plant_lat  = plants_yr$Latitude,
-      hyads_uID_nn = hy_src$uID[nn_idx],
-      nn_dist_km   = nn_km,
-      hyads_peak   = hy_src$hyads_peak[nn_idx],
-      hyads_sum    = hy_src$hyads_sum[nn_idx],
-      src_lon      = hy_src$src_lon[nn_idx],
-      src_lat      = hy_src$src_lat[nn_idx]
-    )
+  data.table(
+    year         = yr,
+    plant_id     = plants_yr$plant_id,
+    `Plant Name` = plants_yr$`Plant Name`,
+    `Plant State`= plants_yr$`Plant State`,
+    County       = plants_yr$County,
+    plant_lon    = plants_yr$Longitude,
+    plant_lat    = plants_yr$Latitude,
+
+    hyads_uID_nn = hy_src$uID[nn_idx],
+    nn_dist_km   = nn_km,
+    hyads_peak   = hy_src$hyads_peak[nn_idx],
+    hyads_sum    = hy_src$hyads_sum[nn_idx],
+    src_lon      = hy_src$src_lon[nn_idx],
+    src_lat      = hy_src$src_lat[nn_idx],
+
+    # 新增：HyADS 源点的 Albers 坐标（米）
+    src_x_m      = hy_src$src_x[nn_idx],
+    src_y_m      = hy_src$src_y[nn_idx]
   )
+)
 
   # basic preview per year
   cat("Distance (km) summary:\n"); print(summary(out$nn_dist_km))
@@ -209,6 +214,32 @@ print(match_tbl_all[order(year, nn_dist_km)][1:min(10, .N),
 
 cat("\nRows in final table:", nrow(match_tbl_all), "\n")
 cat("Years covered:", paste(sort(unique(match_tbl_all$year)), collapse = ", "), "\n")
+
+# ======================= STEP E2 ===========================
+# Grid-aligned translation offsets (to align each plume center with the plant)
+# HyADS grid spacing = 36 km in Albers meters
+# ===========================================================
+
+GRID_SPACING_M <- 36000  # 36 km
+
+# match_tbl_all has been created earlier; it must contain
+# plant_x / plant_y (in Albers meters) and src_x_m / src_y_m (source center in Albers)
+
+# Calculate integer grid offsets (number of grid cells to shift) and actual distance in meters
+match_tbl_all[, `:=`(
+  ngrid_dx = as.integer(round((plant_x - src_x_m) / GRID_SPACING_M)),
+  ngrid_dy = as.integer(round((plant_y - src_y_m) / GRID_SPACING_M))
+)]
+
+match_tbl_all[, `:=`(
+  shift_dx_m = ngrid_dx * GRID_SPACING_M,
+  shift_dy_m = ngrid_dy * GRID_SPACING_M
+)]
+
+# Optional: quick quality-check summary
+cat("\n---- E2: Grid-aligned offsets (km) summary ----\n")
+print(summary(match_tbl_all$shift_dx_m / 1000))
+print(summary(match_tbl_all$shift_dy_m / 1000))
 
 # Optional: write to CSV
 data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv")
