@@ -244,10 +244,10 @@ print(summary(match_tbl_all$shift_dy_m / 1000))
 # Optional: write to CSV
 data.table::fwrite(match_tbl_all, "/scratch/xshan2/R_Code/disperseR/coal_plant_to_hyads_mapping_1940_1990.csv")
 
-# ======================= STEP F  ===========================
+# ====================================== STEP F  =====================================
 # Produce by-unit FSTs for 1940–1990 with the exact 2022 schema: x, y, uID, hyads
 # Logic per year: identify active uIDs; keep their per-ton hyads, set all others to 0.
-# ===========================================================
+# ====================================================================================
 
 OUT_DIR <- "/scratch/xshan2/R_Code/disperseR/byunit_fst"
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -285,12 +285,12 @@ for (yr in years_to_write) {
               yr, length(active_uids), all_uids_total))
 }
 
-# ======================= STEP G (no_weight) ===========================
+# ======================= STEP G (no_weight) ========================================
 # Produce TOTAL exposure FSTs identical in structure to PI's outputs:
 # columns: x, y, hyads, year.E, year.D
 # Each file sums across all uIDs (no weighting).
 # Output: /scratch/xshan2/R_Code/disperseR/total_fst/grids_exposures_total_{YEAR}.fst
-# ================================================================================
+# ====================================================================================
 
 suppressPackageStartupMessages({
   library(data.table)
