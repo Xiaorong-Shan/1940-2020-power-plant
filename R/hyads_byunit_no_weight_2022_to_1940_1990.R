@@ -147,7 +147,7 @@ match_tbl_all <- rbindlist(lapply(YEARS, function(yr) {
     src_lon      = hy_src$src_lon[nn_idx],
     src_lat      = hy_src$src_lat[nn_idx],
 
-    # 新增：HyADS 源点的 Albers 坐标（米）
+    # New: HyADS source point coordinates in Albers meters
     src_x_m      = hy_src$src_x[nn_idx],
     src_y_m      = hy_src$src_y[nn_idx]
   )
