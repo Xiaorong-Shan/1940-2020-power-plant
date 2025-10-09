@@ -9,8 +9,8 @@
 #  E2. Compute grid-aligned translation offsets (plume alignment)
 #  F. Generate decadal per-ton by-unit & total FSTs (1940–1990)
 #
-#  Author: [Your Name]
-#  Updated: [Date]
+#  Author: Xiaorong Shan
+#  Updated: October 09, 2025
 ###############################################################
 
 suppressPackageStartupMessages({
