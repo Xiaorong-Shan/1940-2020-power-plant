@@ -36,7 +36,7 @@
 #
 #  AUTHOR / DATE
 #  -------------
-#  [Your Name], [Date]
+# Xiaorong Shan, October 09, 2025
 ###############################################################
 
 suppressPackageStartupMessages({
