@@ -278,6 +278,14 @@ for (yr in years_to_write) {
   # keep per-ton for active uIDs; zero out others
   hy_y[, hyads := fifelse(uID %in% active_uids, hyads, 0)]
 
+   # ---- NEW: add year columns (both equal to current yr) ----
+  hy_y[, `:=`(
+    `year.E` = as.integer(yr),
+    `year.F` = as.integer(yr)
+  )]
+
+  setcolorder(hy_y, c("x","y","uID","hyads","year.E","year.F"))
+
   out_fst <- file.path(OUT_DIR, sprintf("grids_exposures_byunit_%d.fst", yr))
   fst::write_fst(hy_y, out_fst, compress = 50)
 
