@@ -4,14 +4,15 @@
 #  A. Build HyADS uID source points from 2022 per-ton kernel
 #  B. Map (Year, Plant_ID) → nearest HyADS uID using your emission CSV
 #  C. Aggregate emissions to (Year, uID)
+#     ⚠️ MODIFIED: Convert annual SO₂ (tons/year) → monthly tons (tons/month)
 #  D. Compute weighted HyADS at plant (hyads_at_plant_w)
-#     and export annual weighted by-unit & total FSTs
 #  E2. Compute grid-aligned translation offsets (plume alignment)
 #  F. Generate decadal per-ton by-unit & total FSTs (1940–1990)
 #
 #  Author: Xiaorong Shan
-#  Updated: October 09, 2025
+#  Updated: October 15, 2025
 ###############################################################
+
 
 suppressPackageStartupMessages({
   library(data.table)
@@ -119,13 +120,23 @@ map_year_plant_uid_filt <- map_year_plant_uid[!is.na(uID) & nn_km <= MAX_KM]
 # Aggregate emissions to (Year, uID)
 # ===========================================================
 cat("\n[STEP C] Aggregating emissions to (Year, uID)...\n")
+
+# --- aggregate to annual total tons ---
 emiss_plant_year <- emiss[, .(SO2_tons = sum(SO2_tons, na.rm = TRUE)), by = .(Year, Plant_ID)]
-emiss_uid_year <- map_year_plant_uid_filt[emiss_plant_year, on = .(Year, Plant_ID), nomatch = 0L][
+
+# --- MODIFIED: convert annual → monthly tons ---
+emiss_plant_year[, SO2_tons_month := SO2_tons / 12]  ### MODIFIED ###
+setnames(emiss_plant_year, "SO2_tons_month", "SO2_tons")  ### MODIFIED ###
+
+# Aggregate to uID
+emiss_uid_year <- map_year_plant_uid_filt[emiss_plant_year,
+                                          on = .(Year, Plant_ID), nomatch = 0L][
   , .(SO2_tons = sum(SO2_tons, na.rm = TRUE)), by = .(Year, uID)]
 emiss_uid_year[, uID := as.character(uID)]
 setkey(emiss_uid_year, Year, uID)
+
 write_fst(emiss_uid_year, file.path(WEIGHTED_DIR, "emiss_uid_year.fst"), compress = FST_COMPRESS)
-cat("Saved emiss_uid_year.fst with", nrow(emiss_uid_year), "rows.\n")
+cat("Saved emiss_uid_year.fst with", nrow(emiss_uid_year), "rows (monthly tons).\n")
 
 
 # ======================= STEP D ============================
