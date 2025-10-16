@@ -124,10 +124,6 @@ cat("\n[STEP C] Aggregating emissions to (Year, uID)...\n")
 # --- aggregate to annual total tons ---
 emiss_plant_year <- emiss[, .(SO2_tons = sum(SO2_tons, na.rm = TRUE)), by = .(Year, Plant_ID)]
 
-# --- MODIFIED: convert annual → monthly tons ---
-emiss_plant_year[, SO2_tons_month := SO2_tons / 12]  ### MODIFIED ###
-setnames(emiss_plant_year, "SO2_tons_month", "SO2_tons")  ### MODIFIED ###
-
 # Aggregate to uID
 emiss_uid_year <- map_year_plant_uid_filt[emiss_plant_year,
                                           on = .(Year, Plant_ID), nomatch = 0L][
@@ -136,7 +132,7 @@ emiss_uid_year[, uID := as.character(uID)]
 setkey(emiss_uid_year, Year, uID)
 
 write_fst(emiss_uid_year, file.path(WEIGHTED_DIR, "emiss_uid_year.fst"), compress = FST_COMPRESS)
-cat("Saved emiss_uid_year.fst with", nrow(emiss_uid_year), "rows (monthly tons).\n")
+cat("Saved emiss_uid_year.fst with", nrow(emiss_uid_year), "rows (annual tons).\n")
 
 
 # ======================= STEP D ============================
