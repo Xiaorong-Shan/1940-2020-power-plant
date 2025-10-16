@@ -4,7 +4,6 @@
 #  A. Build HyADS uID source points from 2022 per-ton kernel
 #  B. Map (Year, Plant_ID) → nearest HyADS uID using your emission CSV
 #  C. Aggregate emissions to (Year, uID)
-#     ⚠️ MODIFIED: Convert annual SO₂ (tons/year) → monthly tons (tons/month)
 #  D. Compute weighted HyADS at plant (hyads_at_plant_w)
 #  E2. Compute grid-aligned translation offsets (plume alignment)
 #  F. Generate decadal per-ton by-unit & total FSTs (1940–1990)
