@@ -1,35 +1,37 @@
 #!/usr/bin/env Rscript
 ###############################################################################
-# Script: PWE_county_1940_1990_full.R
+# Script: PWE_county_1940_1990.R
 # Author: Xiaorong Shan
 #
 # Goal:
 #   Compute county-level coal PM2.5 (HyADS, 36-km grid) and population-weighted
-#   PM2.5 exposure (PWE) for 1940–1990 (decadal).
+#   PM2.5 exposure (PWE) for 1940–1990 (decadal), and generate figures
+#   WITHOUT capping and WITHOUT white (NA) counties on maps (force NA->0).
 #
 # Inputs:
-#   (1) HyADS gridded PM2.5 .fst files at 36-km resolution, Albers (x,y,vals.out)
-#       Expected filenames: grids_pm25_total_YYYY.fst
-#   (2) NHGIS county population time series (wide), e.g. A00AA1940 ... A00AA1990
+#   (1) HyADS gridded PM2.5 .fst files (x,y,vals.out), Albers:
+#         grids_pm25_total_YYYY.fst
+#   (2) NHGIS county population time series (wide):
+#         A00AA1940 ... A00AA1990
 #
 # Outputs (written to out_dir):
-#   - county_pm25_pop_YYYY.csv                 (county-level results each decade)
-#   - county_pm25_pop_all_years.csv            (stacked county results)
-#   - national_PWE_1940_1990.csv               (national PWE time series)
-#   - state_PWE_1940_1990.csv                  (state PWE time series)
+#   - county_pm25_pop_YYYY.csv
+#   - county_pm25_pop_all_years.csv
+#   - national_PWE_1940_1990.csv
+#   - state_PWE_1940_1990.csv
 #
-# Visualization (PDF):
-#   MAIN FIG (recommended for manuscript):
-#     - FIG_MAIN_burden_log_maps_1940_1990.pdf  (log-scaled PM2.5×pop maps)
-#     - FIG_MAIN_national_PWE_trend_1940_1990.pdf (PWE trend line)
-#
-# SI FIG (recommended for supplement):
-#     - FIG_SI_pm25_maps_1940_1990.pdf          (county mean PM2.5 maps)
+# Figures (PDF):
+#   MAIN:
+#     - FIG_MAIN_contrib_log1p_scaled_1990median_1940_1990.pdf
+#     - FIG_MAIN_national_PWE_trend_1940_1990.pdf
+#   SI:
+#     - FIG_SI_pm25_maps_1940_1990.pdf
 #
 # Notes:
-#   - For mapping "human exposure intensity", we visualize log(1 + PM2.5×pop).
-#     This is unitless and intended for comparative visualization only.
-#   - For quantitative reporting, use PWE (μg/m^3).
+#   - No capping/truncation is applied.
+#   - Any missing counties on maps are forced to 0 (lowest color), no white.
+#   - Contribution map uses monotone transform for readability:
+#       log(1 + contrib / median_1990)
 ###############################################################################
 
 suppressPackageStartupMessages({
@@ -47,24 +49,17 @@ years <- c(1940, 1950, 1960, 1970, 1980, 1990)
 
 base_dir <- "/scratch/xshan2/R_Code/disperseR/main/output/pm25_decades_model.lm.cv_single_poly_proxy1999met"
 pop_file <- "/scratch/xshan2/R_Code/powerplant/data/population/nhgis0012_csv/nhgis0012_ts_nominal_county.csv"
-
-# Expected HyADS filenames:
 fst_template <- "grids_pm25_total_%d.fst"
 
-# Output folder (feel free to rename)
-out_dir <- file.path(base_dir, "pwe_outputs_decades_FULL_hopperSafe")
+out_dir <- file.path(base_dir, "pwe_outputs_decades_FULL_NOcap_NOwhite")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Albers Equal-Area projection used by HyADS grids
 p4s <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m"
 
 cat("Output directory:\n", out_dir, "\n\n")
-
 stopifnot(file.exists(pop_file))
 
 # ===================== HELPERS =====================
-
-# Format county GEOID to 5-digit string (STATEFP(2)+COUNTYFP(3))
 fmt_geoid5 <- function(x) {
   x <- as.character(x)
   x <- gsub("\\D", "", x)
@@ -72,7 +67,6 @@ fmt_geoid5 <- function(x) {
   x
 }
 
-# Convert .fst (x,y,vals.out) to RasterLayer and assign CRS
 make_raster_albers <- function(fst_path, p4s) {
   dt <- as.data.table(fst::read_fst(fst_path))
   if (!all(c("x", "y", "vals.out") %in% names(dt))) {
@@ -83,8 +77,6 @@ make_raster_albers <- function(fst_path, p4s) {
   r
 }
 
-# Robust area-weighted mean using raster::extract(weights=TRUE)
-# Handles different extract return formats across raster versions.
 area_weighted_mean_by_polygon <- function(r, polys_sf) {
   polys_sp <- methods::as(polys_sf, "Spatial")
   v_list <- raster::extract(r, polys_sp, weights = TRUE, na.rm = TRUE)
@@ -96,7 +88,6 @@ area_weighted_mean_by_polygon <- function(r, polys_sf) {
       if (nrow(x) == 0) return(NA_real_)
       vals <- x[, 1]
 
-      # Try common weight column names
       cand <- c("weight", "weights", "w", "wt", "frac", "fraction")
       wcol <- cand[cand %in% colnames(x)][1]
 
@@ -105,7 +96,6 @@ area_weighted_mean_by_polygon <- function(r, polys_sf) {
         return(stats::weighted.mean(vals, wts, na.rm = TRUE))
       }
 
-      # Fallback: if there are >=2 columns, the 2nd column is often weights in [0,1]
       if (ncol(x) >= 2) {
         wts <- x[, 2]
         if (!all(is.na(wts)) && max(wts, na.rm = TRUE) <= 1.0001) {
@@ -113,52 +103,36 @@ area_weighted_mean_by_polygon <- function(r, polys_sf) {
         }
       }
 
-      # Final fallback: simple mean (keeps pipeline running)
       return(mean(vals, na.rm = TRUE))
     }
 
     if (is.numeric(x)) return(mean(x, na.rm = TRUE))
-
     NA_real_
   })
 
   as.numeric(v)
 }
 
-# Cap extreme values for visualization without requiring extra packages
-cap_at <- function(x, upper) {
-  x2 <- x
-  x2[is.na(x2)] <- 0
-  x2[x2 > upper] <- upper
-  x2
-}
-
-# ===================== 1) LOAD COUNTY GEOMETRY (ONCE) =====================
+# ===================== 1) LOAD COUNTY GEOMETRY =====================
 counties_sf <- USAboundaries::us_counties()
 counties_sf <- counties_sf[, !duplicated(names(counties_sf))]
 
 keep_cols <- intersect(c("geoid", "state_abbr", "stusps", "state_name", "name", "geometry"), names(counties_sf))
 counties_sf <- counties_sf[, keep_cols]
 
-# Ensure state_abbr exists
 if (!("state_abbr" %in% names(counties_sf)) && ("stusps" %in% names(counties_sf))) {
   counties_sf$state_abbr <- counties_sf$stusps
 }
 
 # CONUS only
 counties_sf <- counties_sf[!(counties_sf$state_abbr %in% c("AK", "HI", "PR")), ]
-
-# Fix GEOID early (critical for reliable merges)
 counties_sf$geoid <- fmt_geoid5(counties_sf$geoid)
-
-# Reproject to match HyADS grid CRS
 counties_sf <- sf::st_transform(counties_sf, crs = p4s)
 
 cat("CONUS counties loaded:", nrow(counties_sf), "\n\n")
 
-# ===================== 2) LOAD POPULATION (WIDE -> LONG FOR TARGET YEARS) =====================
+# ===================== 2) LOAD POPULATION (WIDE -> LONG) =====================
 pop_ts <- fread(pop_file)
-
 pop_cols <- paste0("A00AA", years)
 cols_needed <- c("STATEFP", "COUNTYFP", pop_cols)
 stopifnot(all(cols_needed %in% names(pop_ts)))
@@ -174,6 +148,7 @@ pop_long[, year := as.integer(sub("A00AA", "", VAR))]
 pop_long[, geoid := paste0(sprintf("%02d", as.integer(STATEFP)),
                            sprintf("%03d", as.integer(COUNTYFP)))]
 pop_long[, geoid := fmt_geoid5(geoid)]
+pop_long[, pop_year := as.numeric(pop_year)]
 pop_dt <- pop_long[year %in% years, .(geoid, year, pop_year)]
 
 cat("Population rows (all decades):", nrow(pop_dt), "\n\n")
@@ -190,19 +165,17 @@ for (yy in years) {
   fst_path <- file.path(base_dir, sprintf(fst_template, yy))
   if (!file.exists(fst_path)) {
     warning("Missing file: ", fst_path, " (skipping year)")
-    pwe_national[[as.character(yy)]] <- data.frame(year = yy, PWE = NA_real_)
+    pwe_national[[as.character(yy)]] <- data.frame(year = yy, PWE = NA_real_, nat_pop = NA_real_)
     next
   }
 
-  # 3.1 Read raster
   r_yy <- make_raster_albers(fst_path, p4s)
 
-  # quick sanity
+  # Hopper-safe sanity (no raster::range)
   rmin <- raster::cellStats(r_yy, stat = "min", na.rm = TRUE)
   rmax <- raster::cellStats(r_yy, stat = "max", na.rm = TRUE)
   cat("  Raster min/max:", signif(rmin, 6), "/", signif(rmax, 6), "\n")
 
-  # 3.2 County area-weighted PM2.5 means
   cat("  Extracting county weighted means (this can be slow) ...\n")
   pm25_county <- area_weighted_mean_by_polygon(r_yy, counties_sf)
 
@@ -210,7 +183,6 @@ for (yy in years) {
       " | min/max:", signif(min(pm25_county, na.rm = TRUE), 6),
       "/", signif(max(pm25_county, na.rm = TRUE), 6), "\n")
 
-  # 3.3 Build county table (no geometry)
   ctab <- sf::st_drop_geometry(counties_sf)
 
   dt <- data.table(
@@ -222,38 +194,40 @@ for (yy in years) {
     pm25  = as.numeric(pm25_county)
   )
 
-  # 3.4 Merge population for the same year
   pop_year <- pop_dt[year == yy]
   dt <- merge(dt, pop_year, by = c("geoid", "year"), all.x = TRUE)
 
-  # 3.5 Compute burden and contributions (for reporting & maps)
-  # Keep only valid rows for PWE (pm25 and population both present)
-  dt_calc <- dt[!is.na(pm25) & !is.na(pop_year) & pop_year > 0]
+  # Valid rows for PWE math
+  dt_calc <- dt[!is.na(pm25) & is.finite(pm25) &
+                  !is.na(pop_year) & is.finite(pop_year) & pop_year > 0]
 
   if (nrow(dt_calc) == 0) {
     warning("Year ", yy, ": no valid rows after merge/filter; PWE is NA")
     pwe_val <- NA_real_
+    nat_pop <- NA_real_
   } else {
-    pwe_val <- sum(dt_calc$pm25 * dt_calc$pop_year) / sum(dt_calc$pop_year)
+    nat_pop <- sum(dt_calc$pop_year)
+    pwe_val <- sum(dt_calc$pm25 * dt_calc$pop_year) / nat_pop
   }
 
-  # Add burden/contrib for county outputs
-  dt_calc[, burden  := pm25 * pop_year]
-  dt_calc[, contrib := (pm25 * pop_year) / sum(pop_year)]
+  # Add burden and contribution to national PWE (μg/m^3)
+  if (is.finite(nat_pop) && nat_pop > 0) {
+    dt_calc[, burden := pm25 * pop_year]
+    dt_calc[, contrib_nat := burden / nat_pop]  # μg/m^3
+  } else {
+    dt_calc[, burden := NA_real_]
+    dt_calc[, contrib_nat := NA_real_]
+  }
 
   cat("  Rows after merge+filter:", nrow(dt_calc), "\n")
   cat("  National PWE:", signif(pwe_val, 8), "\n\n")
 
-  # 3.6 Save county CSV for this year
-  out_csv <- file.path(out_dir, sprintf("county_pm25_pop_%d.csv", yy))
-  fwrite(dt_calc, out_csv)
+  fwrite(dt_calc, file.path(out_dir, sprintf("county_pm25_pop_%d.csv", yy)))
 
-  # 3.7 Store for combined outputs
   county_all[[as.character(yy)]] <- dt_calc
-  pwe_national[[as.character(yy)]] <- data.frame(year = yy, PWE = pwe_val)
+  pwe_national[[as.character(yy)]] <- data.frame(year = yy, PWE = pwe_val, nat_pop = nat_pop)
 
-  # 3.8 State-level PWE
-  # PWE_state = sum(pm25*pop) / sum(pop) within each state
+  # State-level PWE
   st <- dt_calc[, .(
     PWE_state = sum(pm25 * pop_year) / sum(pop_year),
     pop_total = sum(pop_year)
@@ -271,10 +245,7 @@ fwrite(national_df, file.path(out_dir, "national_PWE_1940_1990.csv"))
 state_df <- rbindlist(pwe_state, fill = TRUE)
 fwrite(state_df, file.path(out_dir, "state_PWE_1940_1990.csv"))
 
-cat("Saved combined outputs:\n")
-cat("  - county_pm25_pop_all_years.csv\n")
-cat("  - national_PWE_1940_1990.csv\n")
-cat("  - state_PWE_1940_1990.csv\n\n")
+cat("Saved combined outputs in:", out_dir, "\n\n")
 
 # ===================== 5) MAIN FIG: NATIONAL PWE TREND (μg/m^3) =====================
 p_trend <- ggplot(national_df, aes(x = year, y = PWE)) +
@@ -290,74 +261,83 @@ p_trend <- ggplot(national_df, aes(x = year, y = PWE)) +
 ggsave(file.path(out_dir, "FIG_MAIN_national_PWE_trend_1940_1990.pdf"),
        p_trend, width = 7.6, height = 4.4, dpi = 300)
 
-# ===================== 6) MAPS (MAIN + SI) =====================
-# Join to county geometry for mapping
-# For visualization, fill missing counties as 0 (lowest color), per your request.
+# ===================== 6) MAIN MAP: COUNTY CONTRIBUTION TO NATIONAL PWE =====================
+# Force NA->0 so there are no white counties.
+cat("Creating MAIN map (no white): contribution to national PWE (log1p scaled to 1990 median)...\n")
+
 map_dt <- copy(county_all_dt)
 map_dt[, geoid := fmt_geoid5(geoid)]
-map_dt[, year := factor(year, levels = years, labels = years)]
+map_dt[, year := as.integer(year)]
 
-# Compute map variables
-map_dt[, pm25_plot := pm25]
-map_dt[is.na(pm25_plot), pm25_plot := 0]
+ref_med_1990 <- as.numeric(median(map_dt[year == 1990]$contrib_nat, na.rm = TRUE))
+if (!is.finite(ref_med_1990) || ref_med_1990 <= 0) ref_med_1990 <- 1e-12
 
-map_dt[, burden := pm25_plot * pop_year]
-map_dt[is.na(burden), burden := 0]
+map_dt[, fill_log1p := log1p(contrib_nat / ref_med_1990)]
+map_dt[!is.finite(fill_log1p) | is.na(fill_log1p), fill_log1p := 0]
 
-map_dt[, burden_log := log1p(burden)]
+map_dt2 <- as.data.frame(map_dt[, .(geoid, year, fill_log1p)])
 
-# Global caps for consistent color across decades
-p99_pm25 <- as.numeric(quantile(map_dt$pm25_plot, 0.99, na.rm = TRUE))
-if (!is.finite(p99_pm25) || p99_pm25 <= 0) p99_pm25 <- max(map_dt$pm25_plot, na.rm = TRUE)
+map_sf <- merge(counties_sf, map_dt2, by = "geoid", all.x = TRUE)
 
-p99_bur <- as.numeric(quantile(map_dt$burden_log, 0.99, na.rm = TRUE))
-if (!is.finite(p99_bur) || p99_bur <= 0) p99_bur <- max(map_dt$burden_log, na.rm = TRUE)
+# ---- HARD ZERO-FILL (no white counties) ----
+map_sf$year <- factor(as.integer(as.character(map_sf$year)), levels = years)
+map_sf$fill_log1p <- as.numeric(map_sf$fill_log1p)
+map_sf$fill_log1p[!is.finite(map_sf$fill_log1p) | is.na(map_sf$fill_log1p)] <- 0
 
-map_dt[, pm25_cap := cap_at(pm25_plot, p99_pm25)]
-map_dt[, burden_log_cap := cap_at(burden_log, p99_bur)]
-
-# Merge with sf (keeps geometry)
-map_sf <- merge(counties_sf, as.data.frame(map_dt[, .(geoid, year, pm25_cap, burden_log_cap)]),
-                by = "geoid", all.x = TRUE)
-
-# Replace any remaining NA in sf after merge as 0 (lowest)
-map_sf$pm25_cap[is.na(map_sf$pm25_cap)] <- 0
-map_sf$burden_log_cap[is.na(map_sf$burden_log_cap)] <- 0
-
-# --- SI FIG: county mean PM2.5 maps (capped at global P99) ---
-p_pm25 <- ggplot(map_sf) +
-  geom_sf(aes(fill = pm25_cap), color = "grey25", linewidth = 0.05) +
+p_main_map <- ggplot(map_sf) +
+  geom_sf(aes(fill = fill_log1p), color = "grey25", linewidth = 0.05) +
   facet_wrap(~ year, nrow = 1) +
   theme_void() +
   theme(
     strip.text = element_text(size = 12),
-    legend.position = "right"
+    legend.position = "right",
+    plot.title = element_text(size = 15)
   ) +
   labs(
-    title = "County mean coal PM2.5 (capped at global P99), 1940–1990",
-    fill = expression(paste("PM"[2.5], " (capped)"))
+    title = "County contribution to national population-weighted coal PM2.5 (scaled to 1990 median; log1p), 1940–1990",
+    fill  = "log(1 + contrib / median_1990)\n(contrib in μg/m³)"
   ) +
-  scale_fill_gradient(low = "black", high = "yellow", limits = c(0, p99_pm25))
+  scale_fill_gradient(low = "black", high = "yellow", na.value = "black")
+
+ggsave(file.path(out_dir, "FIG_MAIN_contrib_log1p_scaled_1990median_1940_1990.pdf"),
+       p_main_map, width = 14, height = 4.6, dpi = 300)
+
+cat("Reference median_1990 contrib_nat (μg/m^3):", signif(ref_med_1990, 8), "\n\n")
+
+# ===================== 7) SI MAP: COUNTY MEAN PM2.5 (LINEAR) =====================
+# Force NA->0 so there are no white counties.
+cat("Creating SI map (no white): county mean PM2.5 (linear, no cap)...\n")
+
+pm25_dt <- copy(county_all_dt)
+pm25_dt[, geoid := fmt_geoid5(geoid)]
+pm25_dt[, year := as.integer(year)]
+pm25_dt[, pm25_plot := as.numeric(pm25)]
+pm25_dt[!is.finite(pm25_plot) | is.na(pm25_plot), pm25_plot := 0]
+
+pm25_sf <- merge(counties_sf, as.data.frame(pm25_dt[, .(geoid, year, pm25_plot)]),
+                 by = "geoid", all.x = TRUE)
+
+# ---- HARD ZERO-FILL (no white counties) ----
+pm25_sf$year <- factor(as.integer(as.character(pm25_sf$year)), levels = years)
+pm25_sf$pm25_plot <- as.numeric(pm25_sf$pm25_plot)
+pm25_sf$pm25_plot[!is.finite(pm25_sf$pm25_plot) | is.na(pm25_sf$pm25_plot)] <- 0
+
+p_pm25 <- ggplot(pm25_sf) +
+  geom_sf(aes(fill = pm25_plot), color = "grey25", linewidth = 0.05) +
+  facet_wrap(~ year, nrow = 1) +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 12),
+    legend.position = "right",
+    plot.title = element_text(size = 15)
+  ) +
+  labs(
+    title = "County mean coal PM2.5 (HyADS; 36-km grid aggregated to counties), 1940–1990",
+    fill = expression(PM[2.5]~(mu*g/m^3))
+  ) +
+  scale_fill_gradient(low = "black", high = "yellow", na.value = "black")
 
 ggsave(file.path(out_dir, "FIG_SI_pm25_maps_1940_1990.pdf"),
        p_pm25, width = 14, height = 4.6, dpi = 300)
-
-# --- MAIN FIG: exposure burden maps (log-scaled, capped at global P99) ---
-p_burden <- ggplot(map_sf) +
-  geom_sf(aes(fill = burden_log_cap), color = "grey25", linewidth = 0.05) +
-  facet_wrap(~ year, nrow = 1) +
-  theme_void() +
-  theme(
-    strip.text = element_text(size = 12),
-    legend.position = "right"
-  ) +
-  labs(
-    title = "Population exposure burden to coal PM2.5 (log-scaled; capped at global P99), 1940–1990",
-    fill = "log(1 + PM2.5×pop)\n(capped)"
-  ) +
-  scale_fill_gradient(low = "black", high = "yellow", limits = c(0, p99_bur))
-
-ggsave(file.path(out_dir, "FIG_MAIN_burden_log_maps_1940_1990.pdf"),
-       p_burden, width = 14, height = 4.6, dpi = 300)
 
 cat("✅ Done. All outputs saved to:\n", out_dir, "\n")
