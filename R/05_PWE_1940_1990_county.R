@@ -253,7 +253,7 @@ p_trend <- ggplot(national_df, aes(x = year, y = PWE)) +
   geom_point(size = 2.4) +
   theme_minimal(base_size = 13) +
   labs(
-    title = "National population-weighted coal PM2.5 exposure (1940–1990)",
+    #title = "National population-weighted coal PM2.5 exposure (1940–1990)",
     x = "Year",
     y = expression(PWE~(mu*g/m^3))
   )
@@ -294,7 +294,7 @@ p_main_map <- ggplot(map_sf) +
     plot.title = element_text(size = 15)
   ) +
   labs(
-    title = "County contribution to national population-weighted coal PM2.5 (scaled to 1990 median; log1p), 1940–1990",
+    #title = "County contribution to national population-weighted coal PM2.5 (scaled to 1990 median; log1p), 1940–1990",
     fill  = "log(1 + contrib / median_1990)\n(contrib in μg/m³)"
   ) +
   scale_fill_gradient(
@@ -338,7 +338,7 @@ p_pm25 <- ggplot(pm25_sf) +
     plot.title = element_text(size = 15)
   ) +
   labs(
-    title = "County mean coal PM2.5 (HyADS; 36-km grid aggregated to counties), 1940–1990",
+    #title = "County mean coal PM2.5 (HyADS; 36-km grid aggregated to counties), 1940–1990",
     fill = expression(PM[2.5]~(mu*g/m^3))
   ) +
   scale_fill_gradient(
