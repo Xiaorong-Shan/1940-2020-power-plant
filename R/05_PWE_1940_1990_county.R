@@ -297,7 +297,13 @@ p_main_map <- ggplot(map_sf) +
     title = "County contribution to national population-weighted coal PM2.5 (scaled to 1990 median; log1p), 1940–1990",
     fill  = "log(1 + contrib / median_1990)\n(contrib in μg/m³)"
   ) +
-  scale_fill_gradient(low = "black", high = "yellow", na.value = "black")
+  scale_fill_gradient(
+  low = "black",
+  high = "yellow",
+  limits = c(0, p99_bur),
+  na.value = "black",
+  guide = guide_colorbar(na.translate = FALSE)
+)
 
 ggsave(file.path(out_dir, "FIG_MAIN_contrib_log1p_scaled_1990median_1940_1990.pdf"),
        p_main_map, width = 14, height = 4.6, dpi = 300)
@@ -335,7 +341,12 @@ p_pm25 <- ggplot(pm25_sf) +
     title = "County mean coal PM2.5 (HyADS; 36-km grid aggregated to counties), 1940–1990",
     fill = expression(PM[2.5]~(mu*g/m^3))
   ) +
-  scale_fill_gradient(low = "black", high = "yellow", na.value = "black")
+  scale_fill_gradient(
+  low = "black",
+  high = "yellow",
+  na.value = "black",
+  guide = guide_colorbar(na.translate = FALSE)
+)
 
 ggsave(file.path(out_dir, "FIG_SI_pm25_maps_1940_1990.pdf"),
        p_pm25, width = 14, height = 4.6, dpi = 300)
