@@ -284,6 +284,56 @@ map_sf$year <- factor(as.integer(as.character(map_sf$year)), levels = years)
 map_sf$fill_log1p <- as.numeric(map_sf$fill_log1p)
 map_sf$fill_log1p[!is.finite(map_sf$fill_log1p) | is.na(map_sf$fill_log1p)] <- 0
 
+library(data.table)
+
+years <- c(1940,1950,1960,1970,1980,1990)
+
+# Ensure types
+county_all_dt <- as.data.table(county_all_dt)
+county_all_dt[, geoid := fmt_geoid5(geoid)]
+county_all_dt[, year  := as.integer(year)]
+county_all_dt[, contrib_nat := as.numeric(contrib_nat)]
+county_all_dt[!is.finite(contrib_nat) | is.na(contrib_nat), contrib_nat := 0]
+
+# 1) Build COMPLETE county x year panel
+panel <- CJ(
+  geoid = unique(counties_sf$geoid),
+  year  = years,
+  unique = TRUE
+)
+
+# 2) Join computed values (keep only what we need)
+panel <- merge(
+  panel,
+  county_all_dt[, .(geoid, year, contrib_nat)],
+  by = c("geoid","year"),
+  all.x = TRUE
+)
+
+# 3) Fill missing as 0 (no white)
+panel[is.na(contrib_nat) | !is.finite(contrib_nat), contrib_nat := 0]
+
+# 4) Visualization transform (NO capping)
+med_1990 <- panel[year == 1990, median(contrib_nat, na.rm = TRUE)]
+if (!is.finite(med_1990) || med_1990 <= 0) med_1990 <- 1e-12
+panel[, fill_log1p := log1p(contrib_nat / med_1990)]
+
+# 5) Ordered facet
+panel[, year := factor(year, levels = years, labels = years)]
+
+# 6) Attach geometry AFTER panel completion (prevents NA facet)
+map_sf <- merge(
+  counties_sf,
+  as.data.frame(panel[, .(geoid, year, fill_log1p)]),
+  by = "geoid",
+  all.x = FALSE,
+  all.y = TRUE
+)
+
+# Final safety: zero-fill
+map_sf$fill_log1p <- as.numeric(map_sf$fill_log1p)
+map_sf$fill_log1p[is.na(map_sf$fill_log1p) | !is.finite(map_sf$fill_log1p)] <- 0
+
 p_main_map <- ggplot(map_sf) +
   geom_sf(aes(fill = fill_log1p), color = "grey25", linewidth = 0.05) +
   facet_wrap(~ year, nrow = 1) +
@@ -311,44 +361,65 @@ ggsave(file.path(out_dir, "FIG_MAIN_contrib_log1p_scaled_1990median_1940_1990.pd
 cat("Reference median_1990 contrib_nat (μg/m^3):", signif(ref_med_1990, 8), "\n\n")
 
 # ===================== 7) SI MAP: COUNTY MEAN PM2.5 (LINEAR) =====================
-# Force NA->0 so there are no white counties.
 cat("Creating SI map (no white): county mean PM2.5 (linear, no cap)...\n")
 
-pm25_dt <- copy(county_all_dt)
+# Ensure types
+pm25_dt <- data.table::copy(county_all_dt)
 pm25_dt[, geoid := fmt_geoid5(geoid)]
-pm25_dt[, year := as.integer(year)]
+pm25_dt[, year  := as.integer(year)]
 pm25_dt[, pm25_plot := as.numeric(pm25)]
 pm25_dt[!is.finite(pm25_plot) | is.na(pm25_plot), pm25_plot := 0]
 
-pm25_sf <- merge(counties_sf, as.data.frame(pm25_dt[, .(geoid, year, pm25_plot)]),
-                 by = "geoid", all.x = TRUE)
+# 1) Build COMPLETE county x year panel (prevents NA facet)
+panel_pm25 <- data.table::CJ(
+  geoid = unique(counties_sf$geoid),
+  year  = years,
+  unique = TRUE
+)
 
-# ---- HARD ZERO-FILL (no white counties) ----
-pm25_sf$year <- factor(as.integer(as.character(pm25_sf$year)), levels = years)
+# 2) Join pm25 onto the full panel
+panel_pm25 <- merge(
+  panel_pm25,
+  pm25_dt[, .(geoid, year, pm25_plot)],
+  by = c("geoid", "year"),
+  all.x = TRUE
+)
+
+# 3) Fill missing as 0 (no white counties)
+panel_pm25[is.na(pm25_plot) | !is.finite(pm25_plot), pm25_plot := 0]
+
+# 4) Ordered facet
+panel_pm25[, year := factor(year, levels = years, labels = years)]
+
+# 5) Attach geometry AFTER panel completion (no NA facet)
+pm25_sf <- merge(
+  counties_sf,
+  as.data.frame(panel_pm25[, .(geoid, year, pm25_plot)]),
+  by = "geoid",
+  all.x = FALSE,
+  all.y = TRUE
+)
+
+# Final safety: force numeric + NA->0 (should be none, but keep it)
 pm25_sf$pm25_plot <- as.numeric(pm25_sf$pm25_plot)
-pm25_sf$pm25_plot[!is.finite(pm25_sf$pm25_plot) | is.na(pm25_sf$pm25_plot)] <- 0
+pm25_sf$pm25_plot[is.na(pm25_sf$pm25_plot) | !is.finite(pm25_sf$pm25_plot)] <- 0
 
 p_pm25 <- ggplot(pm25_sf) +
   geom_sf(aes(fill = pm25_plot), color = "grey25", linewidth = 0.05) +
-  facet_wrap(~ year, nrow = 1) +
+  facet_wrap(~ year, nrow = 1, drop = TRUE) +
   theme_void() +
   theme(
     strip.text = element_text(size = 12),
     legend.position = "right",
     plot.title = element_text(size = 15)
   ) +
-  labs(
-    #title = "County mean coal PM2.5 (HyADS; 36-km grid aggregated to counties), 1940–1990",
-    fill = expression(PM[2.5]~(mu*g/m^3))
-  ) +
+  labs(fill = expression(PM[2.5]~(mu*g/m^3))) +
   scale_fill_gradient(
-  low = "black",
-  high = "yellow",
-  na.value = "black",
-  guide = guide_colorbar(na.translate = FALSE)
-)
+    low = "black",
+    high = "yellow",
+    na.value = "black",
+    guide = guide_colorbar(na.translate = FALSE)
+  )
 
 ggsave(file.path(out_dir, "FIG_SI_pm25_maps_1940_1990.pdf"),
        p_pm25, width = 14, height = 4.6, dpi = 300)
-
-cat("✅ Done. All outputs saved to:\n", out_dir, "\n")
