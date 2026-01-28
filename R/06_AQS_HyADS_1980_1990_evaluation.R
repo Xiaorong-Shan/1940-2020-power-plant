@@ -1,18 +1,25 @@
 # ============================================================
 # AQS (1980/1990) vs HyADS (decade grids) evaluation + PDF plots
-# Requirements per your note:
-# - ONLY save PDF (hopper-friendly)
-# - NO plot titles
-# - File names must be clear, and label as:
-#     Main Figure 1 (主图1): 1990 PM10
-#     Figure S1–S4 (附图1–4): 1980/1990 TSP & Sulfate(TSP)
+# - PDF only (hopper-friendly)
+# - No plot titles
+# - Clear figure naming (Main vs SI)
+# Main Figure 1:
+#   - 1990 PM2.5 STP (AQS) vs HyADS modeled decade-mean PM2.5
+# Supplementary Figures:
+#   - S1: 1990 PM10
+#   - S2: 1990 TSP
+#   - S3: 1990 Sulfate(TSP)
+#   - S4: 1980 TSP
+#   - S5: 1980 Sulfate(TSP)
+#
 # Outputs (in out_dir):
 #   - evaluation_summary.csv
-#   - Fig_Main1_PM10_1990_scatter.pdf
-#   - Fig_S1_TSP_1990_scatter.pdf
-#   - Fig_S2_SulfateTSP_1990_scatter.pdf
-#   - Fig_S3_TSP_1980_scatter.pdf
-#   - Fig_S4_SulfateTSP_1980_scatter.pdf
+#   - Fig_Main1_PM25STP_1990_scatter.pdf
+#   - Fig_S1_PM10_1990_scatter.pdf
+#   - Fig_S2_TSP_1990_scatter.pdf
+#   - Fig_S3_SulfateTSP_1990_scatter.pdf
+#   - Fig_S4_TSP_1980_scatter.pdf
+#   - Fig_S5_SulfateTSP_1980_scatter.pdf
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -100,7 +107,7 @@ plot_scatter_pdf <- function(df, xlab, ylab, pdf_name) {
   p <- ggplot(df, aes(x = mod, y = obs)) +
     geom_point(alpha = 0.35, size = 1) +
     geom_smooth(method = "lm", se = FALSE) +
-    labs(x = xlab, y = ylab) +          # ✅ no title
+    labs(x = xlab, y = ylab) +  # ✅ no title
     annotate("text", x = Inf, y = -Inf,
              hjust = 1.1, vjust = -0.2,
              label = ann, size = 4) +
@@ -134,16 +141,18 @@ hy80_sf <- read_hyads_grid(hyads_1980, p4s)
 hy90_sf <- read_hyads_grid(hyads_1990, p4s)
 
 # -----------------------------
-# Define pollutant filters (based on what you saw)
+# Pollutant filters (AQS Parameter_Name)
 # -----------------------------
-pm10_name <- "PM10 Total 0-10um STP"
-tsp_name  <- "Suspended particulate (TSP)"
-is_sulf_tsp <- function(x) grepl("^Sulfate \\(TSP\\)", x)
+pm25_stp_name <- "PM2.5 STP"
+pm10_name     <- "PM10 Total 0-10um STP"
+tsp_name      <- "Suspended particulate (TSP)"
+is_sulf_tsp   <- function(x) grepl("^Sulfate \\(TSP\\)", x)
 
 # -----------------------------
 # Subset AQS by pollutant
 # -----------------------------
 # 1990
+dt90_pm25 <- dt90[Parameter_Name == pm25_stp_name]
 dt90_pm10 <- dt90[Parameter_Name == pm10_name]
 dt90_tsp  <- dt90[Parameter_Name == tsp_name]
 dt90_sulf <- dt90[is_sulf_tsp(Parameter_Name)]
@@ -152,24 +161,31 @@ dt90_sulf <- dt90[is_sulf_tsp(Parameter_Name)]
 dt80_tsp  <- dt80[Parameter_Name == tsp_name]
 dt80_sulf <- dt80[is_sulf_tsp(Parameter_Name)]
 
+# Fail loudly if main figure has no data
+if (nrow(dt90_pm25) == 0) {
+  stop("No rows found for 1990 'PM2.5 STP' in AQS file. Check Parameter_Name values.")
+}
+
 # -----------------------------
 # Convert to sf + match to HyADS (nearest grid cell)
 # -----------------------------
-pm90_pm10_sf <- match_nearest(to_pm_sf(dt90_pm10), hy90_sf, p4s)
-pm90_tsp_sf  <- match_nearest(to_pm_sf(dt90_tsp),  hy90_sf, p4s)
-pm90_sulf_sf <- match_nearest(to_pm_sf(dt90_sulf), hy90_sf, p4s)
+pm90_pm25_sf <- match_nearest(to_pm_sf(dt90_pm25), hy90_sf, p4s)  # Main
+pm90_pm10_sf <- match_nearest(to_pm_sf(dt90_pm10), hy90_sf, p4s)  # SI
+pm90_tsp_sf  <- match_nearest(to_pm_sf(dt90_tsp),  hy90_sf, p4s)  # SI
+pm90_sulf_sf <- match_nearest(to_pm_sf(dt90_sulf), hy90_sf, p4s)  # SI
 
-pm80_tsp_sf  <- match_nearest(to_pm_sf(dt80_tsp),  hy80_sf, p4s)
-pm80_sulf_sf <- match_nearest(to_pm_sf(dt80_sulf), hy80_sf, p4s)
+pm80_tsp_sf  <- match_nearest(to_pm_sf(dt80_tsp),  hy80_sf, p4s)  # SI
+pm80_sulf_sf <- match_nearest(to_pm_sf(dt80_sulf), hy80_sf, p4s)  # SI
 
 # -----------------------------
 # Metrics table
 # -----------------------------
 summary_dt <- rbindlist(list(
-  eval_one(pm90_pm10_sf, "PM10 (AQS) vs HyADS PM2.5", 1990),
-  eval_one(pm90_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",  1990),
+  eval_one(pm90_pm25_sf, "PM2.5 STP (AQS) vs HyADS PM2.5", 1990),
+  eval_one(pm90_pm10_sf, "PM10 (AQS) vs HyADS PM2.5",      1990),
+  eval_one(pm90_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",       1990),
   eval_one(pm90_sulf_sf, "Sulfate(TSP) (AQS) vs HyADS PM2.5", 1990),
-  eval_one(pm80_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",  1980),
+  eval_one(pm80_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",       1980),
   eval_one(pm80_sulf_sf, "Sulfate(TSP) (AQS) vs HyADS PM2.5", 1980)
 ), fill = TRUE)
 
@@ -177,42 +193,51 @@ fwrite(summary_dt, file.path(out_dir, "evaluation_summary.csv"))
 print(summary_dt)
 
 # -----------------------------
-# PDF plots (NO titles)
-# Naming with Main vs SI labels
+# Axis labels (PM2.5 subscript)
 # -----------------------------
 xlab <- expression(paste("Modeled decade-mean ", PM[2.5], " (HyADS)"))
 ylab <- expression(paste("Observed annual mean concentration (AQS, ", mu, "g/", m^3, ")"))
 
-# 主图1
+# -----------------------------
+# PDF plots (NO titles)
+# Naming with Main vs SI labels
+# -----------------------------
+# Main Figure 1
+plot_scatter_pdf(
+  st_drop_geometry(pm90_pm25_sf)[, c("obs","mod")],
+  xlab, ylab,
+  "Fig_Main1_PM25STP_1990_scatter.pdf"
+)
+
+# Supplementary
 plot_scatter_pdf(
   st_drop_geometry(pm90_pm10_sf)[, c("obs","mod")],
   xlab, ylab,
-  "Fig_Main1_PM10_1990_scatter.pdf"
+  "Fig_S1_PM10_1990_scatter.pdf"
 )
 
-# 附图1–4
 plot_scatter_pdf(
   st_drop_geometry(pm90_tsp_sf)[, c("obs","mod")],
   xlab, ylab,
-  "Fig_S1_TSP_1990_scatter.pdf"
+  "Fig_S2_TSP_1990_scatter.pdf"
 )
 
 plot_scatter_pdf(
   st_drop_geometry(pm90_sulf_sf)[, c("obs","mod")],
   xlab, ylab,
-  "Fig_S2_SulfateTSP_1990_scatter.pdf"
+  "Fig_S3_SulfateTSP_1990_scatter.pdf"
 )
 
 plot_scatter_pdf(
   st_drop_geometry(pm80_tsp_sf)[, c("obs","mod")],
   xlab, ylab,
-  "Fig_S3_TSP_1980_scatter.pdf"
+  "Fig_S4_TSP_1980_scatter.pdf"
 )
 
 plot_scatter_pdf(
   st_drop_geometry(pm80_sulf_sf)[, c("obs","mod")],
   xlab, ylab,
-  "Fig_S4_SulfateTSP_1980_scatter.pdf"
+  "Fig_S5_SulfateTSP_1980_scatter.pdf"
 )
 
 cat("\nDone. PDFs + summary table saved to:\n", out_dir, "\n")
