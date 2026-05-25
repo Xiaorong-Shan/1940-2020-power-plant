@@ -1,40 +1,23 @@
 #!/usr/bin/env Rscript
-###############################################################################
-# Script: PWE_county_1940_1990.R
-# Author: Xiaorong Shan
-#
-# Goal:
-#   Compute county-level coal PM2.5 (HyADS, 36-km grid) and population-weighted
-#   PM2.5 exposure (PWE) for 1940–1990 (decadal), and generate figures
-#   WITHOUT capping and WITHOUT white (NA) counties on maps (force NA->0).
-#
-# Inputs:
-#   (1) HyADS gridded PM2.5 .fst files (x,y,vals.out), Albers:
-#         grids_pm25_total_YYYY.fst
-#   (2) NHGIS county population time series (wide):
-#         A00AA1940 ... A00AA1990
-#
-# Outputs (written to out_dir):
-#   - county_pm25_pop_YYYY.csv
-#   - county_pm25_pop_all_years.csv
-#   - national_PWE_1940_1990.csv
-#   - state_PWE_1940_1990.csv
-#
-# Figures (PDF):
-#   MAIN:
-#     - FIG_MAIN_contrib_log1p_scaled_1990median_1940_1990.pdf
-#     - FIG_MAIN_national_PWE_trend_1940_1990.pdf
-#   SI:
-#     - FIG_SI_pm25_maps_1940_1990.pdf
-#
-# Notes:
-#   - No capping/truncation is applied.
-#   - Any missing counties on maps are forced to 0 (lowest color), no white.
-#   - Contribution map uses monotone transform for readability:
-#       log(1 + contrib / median_1990)
-###############################################################################
-
 #!/usr/bin/env Rscript
+
+###############################################################################
+# Script: PWE_county_1940_1990_with_Fig2B.R
+#
+# Purpose:
+#   1. Compute county-level coal PM2.5 exposure and population-weighted exposure
+#      for 1940–1990.
+#   2. Generate:
+#        - National PWE trend
+#        - County contribution map
+#        - County PM2.5 map
+#        - Fig. 2b: top contributing states and counties bar chart
+#
+# Important:
+#   - No capping is applied to original calculation.
+#   - Map color limits are lowered only for visualization.
+#   - Values above visual maximum are shown using the top color.
+###############################################################################
 
 suppressPackageStartupMessages({
   library(raster)
@@ -61,15 +44,21 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 p4s <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m"
 
+# Visualization-only percentile limits
 main_color_q <- 0.95
 pm25_color_q <- 0.95
+
+# Fig. 2b settings
+fig2b_year <- 1990
+top_n <- 10
 
 cat("Output directory:\n", out_dir, "\n\n")
 cat("Population file:\n", pop_file, "\n\n")
 
 stopifnot(file.exists(pop_file))
 
-# ===================== HELPERS =====================
+# ===================== HELPER FUNCTIONS =====================
+
 fmt_geoid5 <- function(x) {
   x <- as.character(x)
   x <- gsub("\\D", "", x)
@@ -146,6 +135,7 @@ get_plot_max <- function(x, q = 0.95) {
 }
 
 # ===================== 1) LOAD COUNTY GEOMETRY =====================
+
 counties_sf <- USAboundaries::us_counties()
 counties_sf <- counties_sf[, !duplicated(names(counties_sf))]
 
@@ -168,13 +158,15 @@ if (!("name" %in% names(counties_sf))) {
   counties_sf$name <- NA_character_
 }
 
+# CONUS only
 counties_sf <- counties_sf[!(counties_sf$state_abbr %in% c("AK", "HI", "PR")), ]
 counties_sf$geoid <- fmt_geoid5(counties_sf$geoid)
 counties_sf <- sf::st_transform(counties_sf, crs = p4s)
 
 cat("CONUS counties loaded:", nrow(counties_sf), "\n\n")
 
-# ===================== 2) LOAD POPULATION =====================
+# ===================== 2) LOAD POPULATION DATA =====================
+
 pop_ts <- fread(pop_file)
 
 pop_cols <- paste0("A00AA", years)
@@ -210,7 +202,8 @@ pop_dt <- pop_long[year %in% years, .(geoid, year, pop_year)]
 
 cat("Population rows:", nrow(pop_dt), "\n\n")
 
-# ===================== 3) MAIN LOOP =====================
+# ===================== 3) COMPUTE COUNTY PM2.5 AND PWE =====================
+
 pwe_national <- list()
 pwe_state <- list()
 county_all <- list()
@@ -299,7 +292,8 @@ for (yy in years) {
   pwe_state[[as.character(yy)]] <- st
 }
 
-# ===================== 4) WRITE TABLES =====================
+# ===================== 4) SAVE COMPUTED TABLES =====================
+
 county_all_dt <- rbindlist(county_all, fill = TRUE)
 national_df <- rbindlist(pwe_national, fill = TRUE)
 state_df <- rbindlist(pwe_state, fill = TRUE)
@@ -312,9 +306,10 @@ fwrite(county_all_dt, file.path(out_dir, "county_pm25_pop_all_years.csv"))
 fwrite(national_df, file.path(out_dir, "national_PWE_1940_1990.csv"))
 fwrite(state_df, file.path(out_dir, "state_PWE_1940_1990.csv"))
 
-cat("Saved combined outputs.\n\n")
+cat("Saved combined output tables.\n\n")
 
-# ===================== 5) NATIONAL PWE TREND =====================
+# ===================== 5) FIGURE: NATIONAL PWE TREND =====================
+
 p_trend <- ggplot(national_df, aes(x = year, y = PWE)) +
   geom_line(linewidth = 1.1) +
   geom_point(size = 2.4) +
@@ -332,8 +327,9 @@ ggsave(
   dpi = 300
 )
 
-# ===================== 6) MAIN MAP: CONTRIBUTION TO NATIONAL PWE =====================
-cat("Creating MAIN contribution map...\n")
+# ===================== 6) FIGURE: COUNTY CONTRIBUTION MAP =====================
+
+cat("Creating county contribution map...\n")
 
 county_all_dt <- as.data.table(county_all_dt)
 county_all_dt[, geoid := fmt_geoid5(geoid)]
@@ -422,8 +418,9 @@ ggsave(
 cat("Reference median_1990 contrib_nat:", signif(med_1990, 8), "\n")
 cat("Main map visual max:", signif(main_plot_max, 8), "\n\n")
 
-# ===================== 7) SI MAP: COUNTY MEAN PM2.5 =====================
-cat("Creating SI PM2.5 map...\n")
+# ===================== 7) FIGURE: COUNTY MEAN PM2.5 MAP =====================
+
+cat("Creating county PM2.5 map...\n")
 
 pm25_dt <- copy(county_all_dt)
 pm25_dt[, geoid := fmt_geoid5(geoid)]
@@ -502,7 +499,97 @@ ggsave(
 
 cat("PM2.5 map visual max:", signif(pm25_plot_max, 8), "\n\n")
 
-# ===================== 8) SAVE VISUAL SCALE LIMITS =====================
+# ===================== 8) FIG. 2B: TOP CONTRIBUTING STATES AND COUNTIES =====================
+
+cat("Creating Fig. 2b: top contributing states and counties...\n")
+
+fig2b_dt <- copy(county_all_dt)
+fig2b_dt[, year := as.integer(year)]
+fig2b_dt[, contrib_nat := as.numeric(contrib_nat)]
+fig2b_dt[!is.finite(contrib_nat) | is.na(contrib_nat), contrib_nat := 0]
+
+# ---- Top contributing states ----
+top_states <- fig2b_dt[
+  year == fig2b_year,
+  .(
+    contribution = sum(contrib_nat, na.rm = TRUE)
+  ),
+  by = .(state_abbr)
+][
+  order(-contribution)
+][
+  1:top_n
+]
+
+top_states[, label := state_abbr]
+top_states[, type := "States"]
+
+# ---- Top contributing counties ----
+top_counties <- fig2b_dt[
+  year == fig2b_year,
+  .(
+    contribution = sum(contrib_nat, na.rm = TRUE)
+  ),
+  by = .(county_name, state_abbr)
+][
+  order(-contribution)
+][
+  1:top_n
+]
+
+top_counties[, label := paste0(county_name, ", ", state_abbr)]
+top_counties[, type := "Counties"]
+
+# ---- Combine states and counties into one plotting table ----
+fig2b_plot_dt <- rbind(
+  top_states[, .(type, label, contribution)],
+  top_counties[, .(type, label, contribution)]
+)
+
+fig2b_plot_dt[, label := factor(label, levels = rev(unique(label)))]
+
+# ---- Plot Fig. 2b without title ----
+p_fig2b <- ggplot(fig2b_plot_dt, aes(x = label, y = contribution)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  facet_wrap(~ type, scales = "free_y", ncol = 2) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  labs(
+    x = NULL,
+    y = expression("Contribution to national PWE"~(mu*g/m^3))
+  )
+
+ggsave(
+  file.path(out_dir, paste0("FIG_2B_top_contributing_states_counties_", fig2b_year, ".pdf")),
+  p_fig2b,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+fwrite(
+  top_states,
+  file.path(out_dir, paste0("FIG_2B_top_states_", fig2b_year, ".csv"))
+)
+
+fwrite(
+  top_counties,
+  file.path(out_dir, paste0("FIG_2B_top_counties_", fig2b_year, ".csv"))
+)
+
+cat("Fig. 2b saved.\n\n")
+
+# ===================== 9) SAVE VISUAL SCALE LIMITS =====================
+
 plot_scale_limits <- data.table(
   figure = c("MAIN_contribution_map", "SI_pm25_map"),
   visual_percentile = c(main_color_q, pm25_color_q),
