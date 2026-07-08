@@ -1,25 +1,83 @@
+#!/usr/bin/env Rscript
+
 # ============================================================
-# AQS (1980/1990) vs HyADS (decade grids) evaluation + PDF plots
-# - PDF only (hopper-friendly)
-# - No plot titles
-# - Clear figure naming (Main vs SI)
-# Main Figure 1:
-#   - 1990 PM2.5 STP (AQS) vs HyADS modeled decade-mean PM2.5
-# Supplementary Figures:
-#   - S1: 1990 PM10
-#   - S2: 1990 TSP
-#   - S3: 1990 Sulfate(TSP)
-#   - S4: 1980 TSP
-#   - S5: 1980 Sulfate(TSP)
+# Validation of modeled coal PM2.5 against AQS observations
+# (1980 and 1990)
+# ============================================================
 #
-# Outputs (in out_dir):
-#   - evaluation_summary.csv
-#   - Fig_Main1_PM25STP_1990_scatter.pdf
-#   - Fig_S1_PM10_1990_scatter.pdf
-#   - Fig_S2_TSP_1990_scatter.pdf
-#   - Fig_S3_SulfateTSP_1990_scatter.pdf
-#   - Fig_S4_TSP_1980_scatter.pdf
-#   - Fig_S5_SulfateTSP_1980_scatter.pdf
+# Purpose
+#   1. Match AQS monitoring sites to the nearest HyADS grid cell.
+#   2. Evaluate the spatial agreement between modeled coal PM2.5
+#      and observed particulate measurements.
+#   3. Generate the evaluation statistics used in manuscript
+#      Table 1 and Figure 5.
+#
+# Main manuscript outputs
+#
+#   Table 1
+#     Spatial agreement between modeled coal PM2.5 and
+#     observed sulfate concentrations.
+#       - 1980 Sulfate (TSP)
+#       - 1990 Sulfate (TSP)
+#
+#   Figure 5
+#       (a) 1980 Sulfate (TSP) vs modeled coal PM2.5
+#       (b) 1990 Sulfate (TSP) vs modeled coal PM2.5
+#
+# Supplementary outputs
+#
+#   Figures
+#       S1  1990 PM2.5 mass
+#       S2  1990 PM10
+#       S3  1990 Total Suspended Particulate (TSP)
+#       S4  1980 Total Suspended Particulate (TSP)
+#
+#   Supplementary Table
+#       Complete evaluation statistics for PM2.5, PM10, TSP,
+#       and Sulfate (TSP).
+#
+# Evaluation statistics
+#   - Number of monitoring sites
+#   - Pearson correlation
+#   - Spearman correlation
+#   - Coefficient of determination (R2)
+#   - Mean bias (Modeled - Observed)
+#   - Mean absolute error (MAE)
+#   - Root mean squared error (RMSE)
+#
+# Notes
+#   Coal PM2.5 is defined as modeled secondary sulfate PM2.5
+#   attributable to SO2 emissions from coal-fired power plants.
+#
+#   AQS monitoring sites are matched to the nearest HyADS grid cell.
+#
+#   Scatter plots display:
+#       x-axis = Observed annual mean concentration (AQS)
+#       y-axis = Modeled decade-mean coal PM2.5 (HyADS)
+#
+#   Distances greater than MAX_DIST_M are excluded from the
+#   evaluation to avoid unrealistic monitor-grid matches.
+#
+# Output files (out_dir)
+#
+#   Tables
+#       evaluation_summary_all_metrics_distfiltered.csv
+#       Table1_main_sulfate_only.csv
+#       TableS_AQS_all_metrics_distfiltered.csv
+#
+#   Main Figure
+#       Fig5_main_sulfate_1980_1990_polished.pdf
+#
+#   Individual manuscript panels
+#       Fig5a_1980_Sulfate_TSP_polished.pdf
+#       Fig5b_1990_Sulfate_TSP_polished.pdf
+#
+#   Supplementary figures
+#       Scatter_1980_TSP_mass_distfiltered.pdf
+#       Scatter_1990_PM25_mass_distfiltered.pdf
+#       Scatter_1990_PM10_mass_distfiltered.pdf
+#       Scatter_1990_TSP_mass_distfiltered.pdf
+#
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -32,212 +90,272 @@ suppressPackageStartupMessages({
 # -----------------------------
 # User inputs
 # -----------------------------
+
 p4s <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m"
 
-eval_dir <- "/scratch/xshan2/R_Code/disperseR/main/output/pm25_decades_model.lm.cv_single_poly_proxy1999met/evaluation"
-aqs_1980 <- file.path(eval_dir, "annual_conc_by_monitor_1980.csv")
-aqs_1990 <- file.path(eval_dir, "annual_conc_by_monitor_1990.csv")
+base_dir <- "/scratch/xshan2/R_Code/disperseR/main/output/pm25_decades_model.lm.cv_single_poly_proxy1999met"
+eval_dir <- file.path(base_dir, "evaluation")
 
-hyads_dir <- "/scratch/xshan2/R_Code/disperseR/main/output/pm25_decades_model.lm.cv_single_poly_proxy1999met"
-hyads_1980 <- file.path(hyads_dir, "grids_pm25_total_1980.fst")
-hyads_1990 <- file.path(hyads_dir, "grids_pm25_total_1990.fst")
-
-out_dir <- file.path(eval_dir, "aqs_hyads_eval_out_pdfonly")
+out_dir <- file.path(eval_dir, "aqs_hyads_eval_revised")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-stopifnot(file.exists(aqs_1980), file.exists(aqs_1990))
-stopifnot(file.exists(hyads_1980), file.exists(hyads_1990))
+MAX_DIST_M <- 100000  # 100 km; for sensitivity testing, try 50000
+
+aqs_files <- list(
+  `1980` = file.path(eval_dir, "annual_conc_by_monitor_1980.csv"),
+  `1990` = file.path(eval_dir, "annual_conc_by_monitor_1990.csv")
+)
+
+hyads_files <- list(
+  `1980` = file.path(base_dir, "grids_pm25_total_1980.fst"),
+  `1990` = file.path(base_dir, "grids_pm25_total_1990.fst")
+)
+
+stopifnot(all(file.exists(unlist(aqs_files))))
+stopifnot(all(file.exists(unlist(hyads_files))))
+
+cat("Output directory:\n", out_dir, "\n\n")
+cat("Distance threshold:", MAX_DIST_M / 1000, "km\n\n")
 
 # -----------------------------
-# Helpers
+# Helper functions
 # -----------------------------
+
 read_aqs_annual <- function(f) {
   dt <- fread(f)
   setnames(dt, gsub(" ", "_", names(dt)))
-  req <- c("State_Code","County_Code","Site_Num","Latitude","Longitude",
-           "Parameter_Name","Parameter_Code","Arithmetic_Mean","Year")
+
+  req <- c(
+    "State_Code", "County_Code", "Site_Num",
+    "Latitude", "Longitude",
+    "Parameter_Name", "Parameter_Code",
+    "Arithmetic_Mean", "Year"
+  )
   miss <- setdiff(req, names(dt))
-  if (length(miss) > 0) stop("AQS file missing columns: ", paste(miss, collapse=", "))
+  if (length(miss) > 0) {
+    stop("AQS file missing columns: ", paste(miss, collapse = ", "))
+  }
+
+  dt[, State_Code := as.integer(State_Code)]
+  dt[, County_Code := as.integer(County_Code)]
+  dt[, Site_Num := as.integer(Site_Num)]
+  dt[, Latitude := as.numeric(Latitude)]
+  dt[, Longitude := as.numeric(Longitude)]
+  dt[, Arithmetic_Mean := as.numeric(Arithmetic_Mean)]
+  dt[, Year := as.integer(Year)]
+
   dt
 }
 
 read_hyads_grid <- function(f, p4s) {
-  dt <- read_fst(f, as.data.table = TRUE)
-  req <- c("x","y","vals.out")
+  dt <- fst::read_fst(f, as.data.table = TRUE)
+
+  req <- c("x", "y", "vals.out")
   miss <- setdiff(req, names(dt))
-  if (length(miss) > 0) stop("HyADS fst missing columns: ", paste(miss, collapse=", "))
-  st_as_sf(dt, coords = c("x","y"), crs = st_crs(p4s), remove = FALSE)
+  if (length(miss) > 0) {
+    stop("HyADS fst missing columns: ", paste(miss, collapse = ", "))
+  }
+
+  dt[, x := as.numeric(x)]
+  dt[, y := as.numeric(y)]
+  dt[, vals.out := as.numeric(vals.out)]
+
+  st_as_sf(dt, coords = c("x", "y"), crs = st_crs(p4s), remove = FALSE)
 }
 
-to_pm_sf <- function(dt) {
-  pm <- dt[, .(
-    site_id = paste(State_Code, County_Code, Site_Num, sep = "_"),
-    lon = as.numeric(Longitude),
-    lat = as.numeric(Latitude),
-    obs = as.numeric(Arithmetic_Mean),
-    year = as.integer(Year),
-    Parameter_Name,
-    Parameter_Code
-  )]
-  pm <- pm[is.finite(lon) & is.finite(lat) & is.finite(obs)]
-  st_as_sf(pm, coords = c("lon","lat"), crs = 4326)
-}
-
-match_nearest <- function(obs_sf_ll, hyads_sf, p4s) {
-  obs_sf <- st_transform(obs_sf_ll, st_crs(p4s))
-  idx <- st_nearest_feature(obs_sf, hyads_sf)
-  obs_sf$mod <- hyads_sf$vals.out[idx]
-  obs_sf
-}
-
-metrics <- function(obs, mod) {
-  ok <- is.finite(obs) & is.finite(mod)
-  obs <- obs[ok]; mod <- mod[ok]
-  if (length(obs) < 10) return(list(n=length(obs), pearson=NA_real_, spearman=NA_real_, r2=NA_real_))
-  r  <- suppressWarnings(cor(obs, mod, method="pearson"))
-  rs <- suppressWarnings(cor(obs, mod, method="spearman"))
-  list(n=length(obs), pearson=r, spearman=rs, r2=r^2)
-}
-
-plot_scatter_pdf <- function(df, xlab, ylab, pdf_name) {
-  m <- metrics(df$obs, df$mod)
-  ann <- sprintf("n=%d\nPearson r=%.3f\nSpearman \u03C1=%.3f\nR\u00B2=%.3f",
-                 m$n, m$pearson, m$spearman, m$r2)
-
-  p <- ggplot(df, aes(x = mod, y = obs)) +
-    geom_point(alpha = 0.35, size = 1) +
-    geom_smooth(method = "lm", se = FALSE) +
-    labs(x = xlab, y = ylab) +  # ✅ no title
-    annotate("text", x = Inf, y = -Inf,
-             hjust = 1.1, vjust = -0.2,
-             label = ann, size = 4) +
-    theme_bw(base_size = 12)
-
-  ggsave(file.path(out_dir, pdf_name), p, width = 6.8, height = 5.2)
-  invisible(p)
-}
-
-eval_one <- function(sfobj, label, decade) {
-  df <- st_drop_geometry(sfobj)
-  m  <- metrics(df$obs, df$mod)
-  data.table(
-    pair = label,
-    decade = decade,
-    n_sites = uniqueN(df$site_id),
-    n_obs = m$n,
-    pearson_r = m$pearson,
-    spearman_rho = m$spearman,
-    r2 = m$r2
+make_site_id <- function(state_code, county_code, site_num) {
+  paste0(
+    sprintf("%02d", as.integer(state_code)), "_",
+    sprintf("%03d", as.integer(county_code)), "_",
+    sprintf("%04d", as.integer(site_num))
   )
 }
 
-# -----------------------------
-# Load data
-# -----------------------------
-dt80 <- read_aqs_annual(aqs_1980)
-dt90 <- read_aqs_annual(aqs_1990)
+to_monitor_sf <- function(dt) {
+  if (nrow(dt) == 0) {
+    stop("No rows passed to to_monitor_sf(). Check AQS parameter filter.")
+  }
 
-hy80_sf <- read_hyads_grid(hyads_1980, p4s)
-hy90_sf <- read_hyads_grid(hyads_1990, p4s)
+  pm <- copy(dt)
+  pm[, site_id := make_site_id(State_Code, County_Code, Site_Num)]
 
-# -----------------------------
-# Pollutant filters (AQS Parameter_Name)
-# -----------------------------
-pm25_stp_name <- "PM2.5 STP"
-pm10_name     <- "PM10 Total 0-10um STP"
-tsp_name      <- "Suspended particulate (TSP)"
-is_sulf_tsp   <- function(x) grepl("^Sulfate \\(TSP\\)", x)
+  pm <- pm[
+    is.finite(Longitude) &
+      is.finite(Latitude) &
+      is.finite(Arithmetic_Mean)
+  ]
 
-# -----------------------------
-# Subset AQS by pollutant
-# -----------------------------
-# 1990
-dt90_pm25 <- dt90[Parameter_Name == pm25_stp_name]
-dt90_pm10 <- dt90[Parameter_Name == pm10_name]
-dt90_tsp  <- dt90[Parameter_Name == tsp_name]
-dt90_sulf <- dt90[is_sulf_tsp(Parameter_Name)]
+  # Collapse repeated records to one observation per monitoring site.
+  pm_site <- pm[
+    ,
+    .(
+      lon = mean(Longitude, na.rm = TRUE),
+      lat = mean(Latitude, na.rm = TRUE),
+      obs = mean(Arithmetic_Mean, na.rm = TRUE),
+      year = Year[1],
+      Parameter_Name = Parameter_Name[1],
+      Parameter_Code = Parameter_Code[1],
+      n_aqs_records = .N
+    ),
+    by = site_id
+  ]
 
-# 1980
-dt80_tsp  <- dt80[Parameter_Name == tsp_name]
-dt80_sulf <- dt80[is_sulf_tsp(Parameter_Name)]
+  pm_site <- pm_site[
+    is.finite(lon) &
+      is.finite(lat) &
+      is.finite(obs)
+  ]
 
-# Fail loudly if main figure has no data
-if (nrow(dt90_pm25) == 0) {
-  stop("No rows found for 1990 'PM2.5 STP' in AQS file. Check Parameter_Name values.")
+  st_as_sf(pm_site, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+}
+
+match_nearest_hyads <- function(obs_sf_ll, hyads_sf, p4s) {
+  obs_sf <- st_transform(obs_sf_ll, st_crs(p4s))
+  idx <- st_nearest_feature(obs_sf, hyads_sf)
+
+  obs_sf$mod <- hyads_sf$vals.out[idx]
+  obs_sf$hyads_x <- hyads_sf$x[idx]
+  obs_sf$hyads_y <- hyads_sf$y[idx]
+  obs_sf$match_dist_m <- as.numeric(
+    st_distance(obs_sf, hyads_sf[idx, ], by_element = TRUE)
+  )
+
+  obs_sf
+}
+
+calc_metrics <- function(obs, mod) {
+  ok <- is.finite(obs) & is.finite(mod)
+  obs <- obs[ok]
+  mod <- mod[ok]
+
+  n <- length(obs)
+  if (n < 10) {
+    return(list(
+      n_obs = n,
+      mean_observed = NA_real_,
+      mean_modeled = NA_real_,
+      mean_bias = NA_real_,
+      mae = NA_real_,
+      rmse = NA_real_,
+      normalized_mean_bias = NA_real_,
+      pearson_r = NA_real_,
+      spearman_rho = NA_real_,
+      r2 = NA_real_,
+      lm_intercept = NA_real_,
+      lm_slope = NA_real_
+    ))
+  }
+
+  diff <- mod - obs
+  pearson_r <- suppressWarnings(cor(obs, mod, method = "pearson"))
+  spearman_rho <- suppressWarnings(cor(obs, mod, method = "spearman"))
+  lm_fit <- suppressWarnings(lm(mod ~ obs))
+  lm_coef <- coef(lm_fit)
+
+  list(
+    n_obs = n,
+    mean_observed = mean(obs, na.rm = TRUE),
+    mean_modeled = mean(mod, na.rm = TRUE),
+    mean_bias = mean(diff, na.rm = TRUE),
+    mae = mean(abs(diff), na.rm = TRUE),
+    rmse = sqrt(mean(diff^2, na.rm = TRUE)),
+    normalized_mean_bias = sum(diff, na.rm = TRUE) / sum(obs, na.rm = TRUE),
+    pearson_r = pearson_r,
+    spearman_rho = spearman_rho,
+    r2 = pearson_r^2,
+    lm_intercept = unname(lm_coef[1]),
+    lm_slope = unname(lm_coef[2])
+  )
+}
+
+safe_file_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
 }
 
 # -----------------------------
-# Convert to sf + match to HyADS (nearest grid cell)
+# Evaluation specification
 # -----------------------------
-pm90_pm25_sf <- match_nearest(to_pm_sf(dt90_pm25), hy90_sf, p4s)  # Main
-pm90_pm10_sf <- match_nearest(to_pm_sf(dt90_pm10), hy90_sf, p4s)  # SI
-pm90_tsp_sf  <- match_nearest(to_pm_sf(dt90_tsp),  hy90_sf, p4s)  # SI
-pm90_sulf_sf <- match_nearest(to_pm_sf(dt90_sulf), hy90_sf, p4s)  # SI
+# Important: "PM2.5 STP" is the AQS Parameter_Name.
+# In the manuscript, report it as PM2.5 mass, not TSP.
 
-pm80_tsp_sf  <- match_nearest(to_pm_sf(dt80_tsp),  hy80_sf, p4s)  # SI
-pm80_sulf_sf <- match_nearest(to_pm_sf(dt80_sulf), hy80_sf, p4s)  # SI
-
-# -----------------------------
-# Metrics table
-# -----------------------------
-summary_dt <- rbindlist(list(
-  eval_one(pm90_pm25_sf, "PM2.5 STP (AQS) vs HyADS PM2.5", 1990),
-  eval_one(pm90_pm10_sf, "PM10 (AQS) vs HyADS PM2.5",      1990),
-  eval_one(pm90_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",       1990),
-  eval_one(pm90_sulf_sf, "Sulfate(TSP) (AQS) vs HyADS PM2.5", 1990),
-  eval_one(pm80_tsp_sf,  "TSP (AQS) vs HyADS PM2.5",       1980),
-  eval_one(pm80_sulf_sf, "Sulfate(TSP) (AQS) vs HyADS PM2.5", 1980)
-), fill = TRUE)
-
-fwrite(summary_dt, file.path(out_dir, "evaluation_summary.csv"))
-print(summary_dt)
-
-# -----------------------------
-# Axis labels (PM2.5 subscript)
-# -----------------------------
-xlab <- expression(paste("Modeled decade-mean ", PM[2.5], " (HyADS)"))
-ylab <- expression(paste("Observed annual mean concentration (AQS, ", mu, "g/", m^3, ")"))
-
-# -----------------------------
-# PDF plots (NO titles)
-# Naming with Main vs SI labels
-# -----------------------------
-# Main Figure 1
-plot_scatter_pdf(
-  st_drop_geometry(pm90_pm25_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_Main1_PM25STP_1990_scatter.pdf"
+eval_specs <- list(
+  list(
+    pair_id = "1990_PM25_mass",
+    year = 1990,
+    match_type = "exact",
+    parameter_name = "PM2.5 STP",
+    parameter_pattern = NA_character_,
+    aqs_metric = "PM2.5 mass",
+    size_fraction = "PM2.5",
+    aqs_parameter_name_for_table = "PM2.5 STP"
+  ),
+  list(
+    pair_id = "1990_PM10_mass",
+    year = 1990,
+    match_type = "exact",
+    parameter_name = "PM10 Total 0-10um STP",
+    parameter_pattern = NA_character_,
+    aqs_metric = "PM10 mass",
+    size_fraction = "PM10",
+    aqs_parameter_name_for_table = "PM10 Total 0-10um STP"
+  ),
+  list(
+    pair_id = "1990_TSP_mass",
+    year = 1990,
+    match_type = "exact",
+    parameter_name = "Suspended particulate (TSP)",
+    parameter_pattern = NA_character_,
+    aqs_metric = "total suspended particulate matter",
+    size_fraction = "TSP",
+    aqs_parameter_name_for_table = "Suspended particulate (TSP)"
+  ),
+  list(
+    pair_id = "1990_Sulfate_TSP",
+    year = 1990,
+    match_type = "regex",
+    parameter_name = NA_character_,
+    parameter_pattern = "^Sulfate \\(TSP\\)",
+    aqs_metric = "sulfate",
+    size_fraction = "TSP",
+    aqs_parameter_name_for_table = "Sulfate (TSP)"
+  ),
+  list(
+    pair_id = "1980_TSP_mass",
+    year = 1980,
+    match_type = "exact",
+    parameter_name = "Suspended particulate (TSP)",
+    parameter_pattern = NA_character_,
+    aqs_metric = "total suspended particulate matter",
+    size_fraction = "TSP",
+    aqs_parameter_name_for_table = "Suspended particulate (TSP)"
+  ),
+  list(
+    pair_id = "1980_Sulfate_TSP",
+    year = 1980,
+    match_type = "regex",
+    parameter_name = NA_character_,
+    parameter_pattern = "^Sulfate \\(TSP\\)",
+    aqs_metric = "sulfate",
+    size_fraction = "TSP",
+    aqs_parameter_name_for_table = "Sulfate (TSP)"
+  )
 )
 
-# Supplementary
-plot_scatter_pdf(
-  st_drop_geometry(pm90_pm10_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_S1_PM10_1990_scatter.pdf"
-)
+# -----------------------------
+# Plot functions
+# -----------------------------
 
-plot_scatter_pdf(
-  st_drop_geometry(pm90_tsp_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_S2_TSP_1990_scatter.pdf"
-)
+make_scatter_plot <- function(plot_dt, spec) {
+  m <- calc_metrics(plot_dt$obs, plot_dt$mod)
 
-plot_scatter_pdf(
-  st_drop_geometry(pm90_sulf_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_S3_SulfateTSP_1990_scatter.pdf"
-)
+  ann <- sprintf(
+    "n = %d\nPearson r = %.2f\nSpearman rho = %.2f\nR2 = %.2f",
+    m$n_obs, m$pearson_r, m$spearman_rho, m$r2
+  )
 
-plot_scatter_pdf(
-  st_drop_geometry(pm80_tsp_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_S4_TSP_1980_scatter.pdf"
-)
-
-plot_scatter_pdf(
-  st_drop_geometry(pm80_sulf_sf)[, c("obs","mod")],
-  xlab, ylab,
-  "Fig_S5_SulfateTSP_1980_scatter.pdf"
-)
-
-cat("\nDone. PDFs + summary table saved to:\n", out_dir, "\n")
+  xlab_txt <- paste0(
+    "Observed annual mean ", spec$aqs_metric,
+    " (", spec$size_fraction, ", AQS, ", spec$year, "; 
