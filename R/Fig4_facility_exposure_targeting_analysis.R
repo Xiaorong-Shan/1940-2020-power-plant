@@ -549,12 +549,13 @@ pareto_dt[, facility_percent := facility_fraction * 100]
 pareto_dt[, exposure_percent := cumulative_exposure_share * 100]
 
 summary_cutoffs <- data.table(
-  cutoff = c(0.01, 0.05, 0.10)
+  cutoff = target_cutoffs
 )
 
 summary_cutoffs[, top_n := pmax(1, ceiling(cutoff * nrow(pareto_dt)))]
 summary_cutoffs[, exposure_share := pareto_dt$cumulative_exposure_share[top_n]]
 summary_cutoffs[, exposure_percent := exposure_share * 100]
+summary_cutoffs[, total_facilities := nrow(pareto_dt)]
 
 fwrite(
   summary_cutoffs,
@@ -703,6 +704,94 @@ fwrite(
   targeting_dt,
   file.path(out_dir, "FIG_4C_targeting_efficiency.csv")
 )
+
+# ===================== 10.1) MANUSCRIPT SUMMARY TABLES =====================
+
+# This table gives the facility counts (n) associated with each percentage cutoff
+# and the cumulative exposure share captured by the top-ranked facilities.
+facility_count_summary <- summary_cutoffs[
+  ,
+  .(
+    cutoff_fraction = cutoff,
+    cutoff_percent = cutoff * 100,
+    total_facilities,
+    n_facilities = top_n,
+    cumulative_exposure_percent = exposure_percent
+  )
+][order(cutoff_fraction)]
+
+# Convert the targeting results to wide format so that the exposure-based and
+# SO2-based strategies are shown side by side for manuscript writing.
+targeting_wide <- dcast(
+  targeting_dt,
+  cutoff_fraction + cutoff_percent + n_removed ~ strategy,
+  value.var = "exposure_reduction_percent"
+)
+
+setnames(
+  targeting_wide,
+  old = c("Exposure-based ranking", "SO2 emissions-based ranking"),
+  new = c("exposure_based_reduction_percent", "so2_based_reduction_percent"),
+  skip_absent = TRUE
+)
+
+manuscript_summary <- merge(
+  facility_count_summary,
+  targeting_wide[
+    ,
+    .(
+      cutoff_fraction,
+      cutoff_percent,
+      n_removed,
+      exposure_based_reduction_percent,
+      so2_based_reduction_percent
+    )
+  ],
+  by = c("cutoff_fraction", "cutoff_percent"),
+  all.x = TRUE
+)
+
+# Rounded version for direct manuscript use.
+manuscript_summary_rounded <- copy(manuscript_summary)
+num_cols_round <- c(
+  "cumulative_exposure_percent",
+  "exposure_based_reduction_percent",
+  "so2_based_reduction_percent"
+)
+manuscript_summary_rounded[
+  ,
+  (num_cols_round) := lapply(.SD, function(x) round(x, 1)),
+  .SDcols = num_cols_round
+]
+
+fwrite(
+  facility_count_summary,
+  file.path(out_dir, "facility_count_summary_by_cutoff.csv")
+)
+
+fwrite(
+  manuscript_summary_rounded,
+  file.path(out_dir, "Facility_targeting_summary_for_manuscript.csv")
+)
+
+cat("\n========================================\n")
+cat("Facility ranking summary (1940-1990 cumulative)\n")
+cat("========================================\n")
+cat("Total facilities:", unique(manuscript_summary_rounded$total_facilities), "\n\n")
+print(
+  manuscript_summary_rounded[
+    ,
+    .(
+      cutoff_percent,
+      n_facilities,
+      cumulative_exposure_percent,
+      exposure_based_reduction_percent,
+      so2_based_reduction_percent
+    )
+  ]
+)
+cat("\nSaved manuscript summary table:\n")
+cat(file.path(out_dir, "Facility_targeting_summary_for_manuscript.csv"), "\n\n")
 
 p_fig4c <- ggplot(
   targeting_dt,
