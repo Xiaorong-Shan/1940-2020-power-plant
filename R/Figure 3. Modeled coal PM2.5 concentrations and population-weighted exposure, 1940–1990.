@@ -1,0 +1,1048 @@
+#!/usr/bin/env Rscript
+
+# ================================================================
+# Figure 3
+# Modeled coal PM2.5 concentrations and
+# population-weighted exposure, 1940–1990
+#
+# (a) ZIP/ZCTA-level annual mean concentrations
+# (b) ZIP/ZCTA-level concentration distributions
+# (c) National population-weighted exposure
+# ================================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(data.table)
+  library(dplyr)
+  library(fst)
+  library(ggplot2)
+  library(scales)
+  library(USAboundaries)
+  library(grid)
+  library(gridExtra)
+})
+
+# ================================================================
+# 0. Settings
+# ================================================================
+
+YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
+
+BASE_DIR <- paste0(
+  "/scratch/xshan2/R_Code/disperseR/main/output/",
+  "pm25_decades_model.lm.cv_single_poly_proxy1999met"
+)
+
+ZIP_DATA_DIR <- file.path(
+  BASE_DIR,
+  "zips_exposures"
+)
+
+PWE_FILE <- file.path(
+  BASE_DIR,
+  "pwe_outputs_decades_FULL_NOcap_NOwhite",
+  "national_PWE_1940_1990.csv"
+)
+
+FIG_DIR <- file.path(
+  BASE_DIR,
+  "figures_revised"
+)
+
+dir.create(
+  FIG_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ZCTA_SHP <- paste0(
+  "/projects/HAQ_LAB/lhennem/disperseR/",
+  "main/input/zcta_500k/",
+  "cb_2017_us_zcta510_500k.shp"
+)
+
+P4S <- paste0(
+  "+proj=aea +lat_1=20 +lat_2=60 ",
+  "+lat_0=40 +lon_0=-96 ",
+  "+x_0=0 +y_0=0 ",
+  "+ellps=GRS80 +datum=NAD83 +units=m"
+)
+
+MAP_CAP_QUANTILE <- 0.99
+
+FIGURE_WIDTH <- 7.4
+FIGURE_HEIGHT <- 8.2
+
+# ================================================================
+# 1. Check required inputs
+# ================================================================
+
+if (!file.exists(ZCTA_SHP)) {
+  stop(
+    "ZCTA shapefile not found: ",
+    ZCTA_SHP
+  )
+}
+
+if (!file.exists(PWE_FILE)) {
+  stop(
+    paste0(
+      "National PWE file not found:\n",
+      PWE_FILE,
+      "\nRun the PWE county script first."
+    )
+  )
+}
+
+files_total <- file.path(
+  ZIP_DATA_DIR,
+  sprintf(
+    "zips_pm25_total_%d.fst",
+    YEARS
+  )
+)
+
+files_byunit <- file.path(
+  ZIP_DATA_DIR,
+  sprintf(
+    "zips_pm25_byunit_%d.fst",
+    YEARS
+  )
+)
+
+if (all(file.exists(files_total))) {
+
+  zip_files <- files_total
+  message("Using zips_pm25_total_YYYY.fst")
+
+} else if (all(file.exists(files_byunit))) {
+
+  zip_files <- files_byunit
+
+  message(
+    paste0(
+      "Using zips_pm25_byunit_YYYY.fst; ",
+      "unit columns will be summed."
+    )
+  )
+
+} else {
+
+  stop(
+    paste0(
+      "Complete ZIP exposure files were not found in:\n",
+      ZIP_DATA_DIR
+    )
+  )
+}
+
+# ================================================================
+# 2. Helper functions
+# ================================================================
+
+format_zip5 <- function(x) {
+
+  x <- as.character(x)
+  x <- gsub("\\D", "", x)
+
+  sprintf(
+    "%05d",
+    as.integer(x)
+  )
+}
+
+read_zip_exposure <- function(fpath) {
+
+  dt <- fst::read_fst(
+    fpath,
+    as.data.table = TRUE
+  )
+
+  # Standardize ZIP field
+  if (!("ZIP" %in% names(dt))) {
+
+    if ("zip" %in% names(dt)) {
+      data.table::setnames(dt, "zip", "ZIP")
+    }
+
+    if ("ZCTA" %in% names(dt)) {
+      data.table::setnames(dt, "ZCTA", "ZIP")
+    }
+  }
+
+  if (!("ZIP" %in% names(dt))) {
+    stop(
+      "No ZIP/ZCTA field found in: ",
+      fpath
+    )
+  }
+
+  year_value <- as.integer(
+    sub(
+      ".*_(\\d{4})\\.fst$",
+      "\\1",
+      basename(fpath)
+    )
+  )
+
+  if (!is.finite(year_value)) {
+    stop(
+      "Cannot parse year from filename: ",
+      fpath
+    )
+  }
+
+  dt[, ZIP := format_zip5(ZIP)]
+
+  value_columns <- setdiff(
+    names(dt),
+    "ZIP"
+  )
+
+  if ("total" %in% value_columns) {
+
+    dt[, value := as.numeric(total)]
+
+  } else {
+
+    numeric_columns <- value_columns[
+      vapply(
+        dt[, ..value_columns],
+        is.numeric,
+        logical(1)
+      )
+    ]
+
+    if (length(numeric_columns) == 0) {
+      stop(
+        "No numeric exposure columns found in: ",
+        fpath
+      )
+    }
+
+    dt[
+      ,
+      value := rowSums(
+        .SD,
+        na.rm = TRUE
+      ),
+      .SDcols = numeric_columns
+    ]
+  }
+
+  output <- dt[
+    ,
+    .(
+      value = sum(
+        value,
+        na.rm = TRUE
+      )
+    ),
+    by = ZIP
+  ]
+
+  output[, year := year_value]
+
+  output
+}
+
+# ================================================================
+# 3. Read ZIP/ZCTA exposure data
+# ================================================================
+
+zips_dt <- rbindlist(
+  lapply(
+    zip_files,
+    read_zip_exposure
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+zips_dt[, year := as.integer(year)]
+
+zips_dt <- zips_dt[
+  year %in% YEARS &
+    is.finite(value) &
+    !is.na(value)
+]
+
+if (nrow(zips_dt) == 0) {
+  stop(
+    "No valid ZIP/ZCTA exposure observations were loaded."
+  )
+}
+
+message(
+  "ZIP-year observations loaded: ",
+  nrow(zips_dt)
+)
+
+message(
+  "Exposure range: ",
+  paste(
+    signif(
+      range(
+        zips_dt$value,
+        na.rm = TRUE
+      ),
+      5
+    ),
+    collapse = " to "
+  )
+)
+
+# ================================================================
+# 4. Global P99 color scale
+# ================================================================
+
+valid_map_values <- zips_dt[
+  is.finite(value) &
+    value >= 0,
+  value
+]
+
+map_cap <- as.numeric(
+  quantile(
+    valid_map_values,
+    probs = MAP_CAP_QUANTILE,
+    na.rm = TRUE,
+    names = FALSE
+  )
+)
+
+if (!is.finite(map_cap) || map_cap <= 0) {
+  map_cap <- max(
+    valid_map_values,
+    na.rm = TRUE
+  )
+}
+
+if (!is.finite(map_cap) || map_cap <= 0) {
+  map_cap <- 1e-4
+}
+
+map_breaks <- seq(
+  0,
+  map_cap,
+  length.out = 4
+)
+
+# Mathematical expression renders ≥ correctly
+map_labels <- expression(
+  0.0,
+  0.2,
+  0.3,
+  phantom(0) >= 0.5
+)
+
+message(
+  "Global P99 map cap: ",
+  signif(map_cap, 5)
+)
+
+# ================================================================
+# 5. Prepare ZCTA geometry
+# ================================================================
+
+zips_sf <- st_read(
+  ZCTA_SHP,
+  quiet = TRUE
+)
+
+if ("ZCTA5CE10" %in% names(zips_sf)) {
+  names(zips_sf)[
+    names(zips_sf) == "ZCTA5CE10"
+  ] <- "ZCTA"
+}
+
+if (!("ZCTA" %in% names(zips_sf))) {
+  stop(
+    "ZCTA field not found in shapefile."
+  )
+}
+
+zips_sf$ZCTA <- format_zip5(
+  zips_sf$ZCTA
+)
+
+crosswalk_df <- as.data.frame(
+  disperseR::crosswalk
+)
+
+if (!all(
+  c("ZCTA", "ZIP") %in% names(crosswalk_df)
+)) {
+  stop(
+    "disperseR::crosswalk must contain ZCTA and ZIP."
+  )
+}
+
+crosswalk_df <- crosswalk_df %>%
+  transmute(
+    ZCTA = format_zip5(ZCTA),
+    ZIP = format_zip5(ZIP)
+  ) %>%
+  distinct()
+
+zips_sf <- merge(
+  zips_sf,
+  crosswalk_df,
+  by = "ZCTA",
+  all = FALSE
+)
+
+zips_sf <- st_transform(
+  zips_sf,
+  crs = P4S
+)
+
+map_sf <- merge(
+  zips_sf,
+  as.data.frame(zips_dt),
+  by = "ZIP",
+  all = FALSE
+)
+
+map_sf$year <- factor(
+  map_sf$year,
+  levels = YEARS,
+  labels = YEARS
+)
+
+# ================================================================
+# 6. Prepare state boundaries
+# ================================================================
+
+states <- USAboundaries::us_states()
+
+states48 <- states[
+  states$name %in%
+    c(
+      setdiff(
+        state.name,
+        c("Alaska", "Hawaii")
+      ),
+      "District of Columbia"
+    ),
+]
+
+states48 <- st_transform(
+  states48,
+  st_crs(map_sf)
+)
+
+# ================================================================
+# 7. Read national PWE data
+# ================================================================
+
+pwe_data <- fread(
+  PWE_FILE
+)
+
+required_pwe_columns <- c(
+  "year",
+  "PWE"
+)
+
+missing_pwe_columns <- setdiff(
+  required_pwe_columns,
+  names(pwe_data)
+)
+
+if (length(missing_pwe_columns) > 0) {
+  stop(
+    "PWE file is missing columns: ",
+    paste(
+      missing_pwe_columns,
+      collapse = ", "
+    )
+  )
+}
+
+pwe_data <- pwe_data[
+  year %in% YEARS &
+    is.finite(PWE) &
+    !is.na(PWE)
+]
+
+pwe_data[, year := as.integer(year)]
+
+setorder(
+  pwe_data,
+  year
+)
+
+if (nrow(pwe_data) != length(YEARS)) {
+  warning(
+    "The PWE file does not contain exactly one row per year."
+  )
+}
+
+# ================================================================
+# 8. Shared publication theme
+# ================================================================
+
+theme_publication <- function(base_size = 10) {
+
+  theme_classic(
+    base_size = base_size,
+    base_family = "sans"
+  ) +
+    theme(
+      text = element_text(
+        color = "black"
+      ),
+
+      axis.title = element_text(
+        size = base_size,
+        color = "black"
+      ),
+
+      axis.text = element_text(
+        size = base_size - 1,
+        color = "black"
+      ),
+
+      axis.ticks = element_line(
+        color = "black",
+        linewidth = 0.35
+      ),
+
+      axis.ticks.length = unit(
+        0.14,
+        "cm"
+      ),
+
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.45
+      ),
+
+      panel.grid.major.y = element_line(
+        color = "grey88",
+        linewidth = 0.3
+      ),
+
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+
+      plot.margin = margin(
+        t = 6,
+        r = 6,
+        b = 5,
+        l = 6
+      )
+    )
+}
+
+# ================================================================
+# 9. Panel (a): ZIP/ZCTA maps
+# ================================================================
+
+panel_a <- ggplot() +
+  geom_sf(
+    data = map_sf,
+    aes(fill = value),
+    color = NA,
+    linewidth = 0
+  ) +
+  geom_sf(
+    data = states48,
+    inherit.aes = FALSE,
+    fill = NA,
+    color = "grey60",
+    linewidth = 0.12
+  ) +
+  facet_wrap(
+    ~year,
+    ncol = 3,
+    nrow = 2
+  ) +
+  scale_fill_gradientn(
+    colors = c(
+      "#fff7ec",
+      "#fdd49e",
+      "#fc8d59",
+      "#d7301f",
+      "#7f0000"
+    ),
+    limits = c(
+      0,
+      map_cap
+    ),
+    breaks = map_breaks,
+    labels = map_labels,
+    na.value = "white",
+    oob = scales::squish,
+    name = expression(
+      "Coal PM"[2.5] *
+        " (" *
+        mu * "g " * m^{-3} *
+        ")"
+    ),
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(
+        4.5,
+        "cm"
+      ),
+      barheight = unit(
+        0.32,
+        "cm"
+      ),
+      ticks = TRUE
+    )
+  ) +
+  coord_sf(
+    datum = NA
+  ) +
+
+  # Use title instead of tag so (a) has its own row above the strips
+  labs(
+    title = "(a)"
+  ) +
+
+  theme_void(
+    base_size = 10,
+    base_family = "sans"
+  ) +
+  theme(
+    plot.title.position = "plot",
+
+    plot.title = element_text(
+      family = "sans",
+      face = "bold",
+      size = 11,
+      color = "black",
+      hjust = 0,
+      margin = margin(
+        t = 0,
+        r = 0,
+        b = 3,
+        l = 0
+      )
+    ),
+
+    strip.background = element_rect(
+      fill = "grey95",
+      color = "black",
+      linewidth = 0.4
+    ),
+
+    strip.text = element_text(
+      size = 9.5,
+      face = "bold",
+      color = "black",
+      margin = margin(
+        t = 3,
+        r = 3,
+        b = 3,
+        l = 3
+      )
+    ),
+
+    panel.spacing.x = unit(
+      0.75,
+      "lines"
+    ),
+
+    panel.spacing.y = unit(
+      0.65,
+      "lines"
+    ),
+
+    legend.position = "bottom",
+
+    legend.title = element_text(
+      size = 9.5,
+      color = "black",
+      margin = margin(
+        b = 2
+      )
+    ),
+
+    legend.text = element_text(
+      size = 8.5,
+      color = "black"
+    ),
+
+    legend.margin = margin(
+      t = 1,
+      r = 0,
+      b = 1,
+      l = 0
+    ),
+
+    legend.box.spacing = unit(
+      0.15,
+      "cm"
+    ),
+
+    plot.margin = margin(
+      t = 4,
+      r = 8,
+      b = 2,
+      l = 8
+    )
+  )
+
+# ================================================================
+# 10. Panel (b): ZIP/ZCTA boxplots
+# ================================================================
+
+boxplot_data <- as.data.frame(
+  zips_dt
+) %>%
+  mutate(
+    year = factor(
+      year,
+      levels = YEARS,
+      labels = YEARS
+    )
+  )
+
+panel_b <- ggplot(
+  boxplot_data,
+  aes(
+    x = year,
+    y = value,
+    group = year
+  )
+) +
+  geom_boxplot(
+    width = 0.62,
+    linewidth = 0.55,
+    color = "black",
+    fill = "grey90",
+    outlier.shape = 16,
+    outlier.size = 0.65,
+    outlier.alpha = 0.45
+  ) +
+  scale_y_continuous(
+    labels = label_number(
+      accuracy = 0.1,
+      trim = TRUE
+    ),
+    expand = expansion(
+      mult = c(0.02, 0.07)
+    )
+  ) +
+  labs(
+    tag = "(b)",
+    x = "Year",
+    y = expression(
+      "Coal PM"[2.5] *
+        " (" *
+        mu * "g " * m^{-3} *
+        ")"
+    )
+  ) +
+  theme_publication(
+    base_size = 10
+  ) +
+  theme(
+    plot.tag = element_text(
+      family = "sans",
+      face = "bold",
+      size = 11,
+      color = "black"
+    ),
+
+    plot.tag.position = c(
+      0.025,
+      0.975
+    ),
+
+    plot.margin = margin(
+      t = 10,
+      r = 6,
+      b = 5,
+      l = 10
+    )
+  )
+
+# ================================================================
+# 11. Panel (c): national PWE trend
+# ================================================================
+
+panel_c <- ggplot(
+  pwe_data,
+  aes(
+    x = year,
+    y = PWE
+  )
+) +
+  geom_line(
+    color = "#0072B2",
+    linewidth = 1
+  ) +
+  geom_point(
+    color = "#0072B2",
+    fill = "white",
+    shape = 21,
+    size = 2.5,
+    stroke = 0.8
+  ) +
+  scale_x_continuous(
+    breaks = YEARS,
+    limits = c(1938, 1992),
+    expand = expansion(
+      mult = c(0, 0)
+    )
+  ) +
+  scale_y_continuous(
+    labels = label_number(
+      accuracy = 0.01,
+      trim = TRUE
+    ),
+    expand = expansion(
+      mult = c(0.03, 0.08)
+    )
+  ) +
+  labs(
+    tag = "(c)",
+    x = "Year",
+    y = expression(
+      "Population-weighted exposure" ~
+        "(" *
+        mu * "g " * m^{-3} *
+        ")"
+    )
+  ) +
+  theme_publication(
+    base_size = 10
+  ) +
+  theme(
+    plot.tag = element_text(
+      family = "sans",
+      face = "bold",
+      size = 11,
+      color = "black"
+    ),
+
+    plot.tag.position = c(
+      0.025,
+      0.975
+    ),
+
+    plot.margin = margin(
+      t = 10,
+      r = 10,
+      b = 5,
+      l = 6
+    )
+  )
+
+# ================================================================
+# 12. Combine panels
+# ================================================================
+
+# Empty middle column creates separation between (b) and (c)
+bottom_row <- gridExtra::arrangeGrob(
+  panel_b,
+  grid::nullGrob(),
+  panel_c,
+  ncol = 3,
+  widths = c(
+    1,
+    0.09,
+    1
+  )
+)
+
+figure3_combined <- gridExtra::arrangeGrob(
+  panel_a,
+  bottom_row,
+  ncol = 1,
+  heights = c(
+    1.42,
+    1
+  ),
+  padding = unit(
+    0.15,
+    "cm"
+  )
+)
+
+# Preview
+grid::grid.newpage()
+grid::grid.draw(
+  figure3_combined
+)
+
+# ================================================================
+# 13. Output filenames
+# ================================================================
+
+tiff_file <- file.path(
+  FIG_DIR,
+  "Figure_3_coal_PM25_exposure.tiff"
+)
+
+pdf_file <- file.path(
+  FIG_DIR,
+  "Figure_3_coal_PM25_exposure.pdf"
+)
+
+if (file.exists(tiff_file)) {
+  file.remove(tiff_file)
+}
+
+if (file.exists(pdf_file)) {
+  file.remove(pdf_file)
+}
+
+# ================================================================
+# 14. Save TIFF without X11
+# ================================================================
+
+tiff_saved <- FALSE
+
+if (capabilities("cairo")) {
+
+  grDevices::tiff(
+    filename = tiff_file,
+    width = FIGURE_WIDTH,
+    height = FIGURE_HEIGHT,
+    units = "in",
+    res = 600,
+    compression = "lzw",
+    type = "cairo",
+    bg = "white"
+  )
+
+  grid::grid.newpage()
+
+  grid::grid.draw(
+    figure3_combined
+  )
+
+  invisible(
+    grDevices::dev.off()
+  )
+
+  Sys.sleep(1)
+
+  tiff_saved <- file.exists(
+    tiff_file
+  )
+}
+
+if (
+  !tiff_saved &&
+    requireNamespace(
+      "Cairo",
+      quietly = TRUE
+    )
+) {
+
+  Cairo::CairoTIFF(
+    filename = tiff_file,
+    width = FIGURE_WIDTH,
+    height = FIGURE_HEIGHT,
+    units = "in",
+    dpi = 600,
+    compression = "lzw",
+    bg = "white"
+  )
+
+  grid::grid.newpage()
+
+  grid::grid.draw(
+    figure3_combined
+  )
+
+  invisible(
+    grDevices::dev.off()
+  )
+
+  Sys.sleep(1)
+
+  tiff_saved <- file.exists(
+    tiff_file
+  )
+}
+
+# ================================================================
+# 15. Save PDF
+# ================================================================
+
+grDevices::pdf(
+  file = pdf_file,
+  width = FIGURE_WIDTH,
+  height = FIGURE_HEIGHT,
+  onefile = TRUE,
+  useDingbats = FALSE,
+  paper = "special",
+  bg = "white"
+)
+
+grid::grid.newpage()
+
+grid::grid.draw(
+  figure3_combined
+)
+
+invisible(
+  grDevices::dev.off()
+)
+
+Sys.sleep(1)
+
+pdf_saved <- file.exists(
+  pdf_file
+)
+
+# ================================================================
+# 16. Confirm outputs
+# ================================================================
+
+if (tiff_saved) {
+
+  message(
+    "TIFF saved successfully: ",
+    normalizePath(tiff_file),
+    " | Size: ",
+    round(
+      file.info(tiff_file)$size / 1024^2,
+      2
+    ),
+    " MB"
+  )
+
+} else {
+
+  warning(
+    paste0(
+      "TIFF was not generated. ",
+      "No compatible Cairo TIFF device was available."
+    )
+  )
+}
+
+if (pdf_saved) {
+
+  message(
+    "PDF saved successfully: ",
+    normalizePath(pdf_file),
+    " | Size: ",
+    round(
+      file.info(pdf_file)$size / 1024,
+      1
+    ),
+    " KB"
+  )
+
+} else {
+
+  warning(
+    paste0(
+      "PDF was not created at:\n",
+      pdf_file
+    )
+  )
+}
