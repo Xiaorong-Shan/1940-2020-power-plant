@@ -1,0 +1,637 @@
+# ================================================================
+# Figure 1
+# Historical power-plant SO2 and NOx emissions, 1940–1990
+#
+# (a) National totals compared across three estimation approaches
+# (b) Fuel-specific comparison of facility reconstruction and AP-42
+# ================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+})
+
+# Install patchwork once if it is unavailable
+if (!requireNamespace("patchwork", quietly = TRUE)) {
+  install.packages("patchwork")
+}
+
+# ================================================================
+# 0. Output settings
+# ================================================================
+
+output_dir <- paste0(
+  "/Users/xshan2/Library/CloudStorage/",
+  "OneDrive-GeorgeMasonUniversity-O365Production/",
+  "GMU_PhD/01_Research/03_powerplant/Figure_plot"
+)
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+decade_years <- seq(1940, 1990, by = 10)
+
+# Unit conversions
+kg_per_short_ton <- 907.18474
+Tg_to_kst <- 1e9 / kg_per_short_ton / 1000
+
+# ================================================================
+# 1. Shared method styles
+# ================================================================
+
+series_levels <- c(
+  "EPA inventory",
+  "Facility reconstruction",
+  "AP-42 replication"
+)
+
+# Colorblind-accessible colors
+series_colors <- c(
+  "EPA inventory"           = "#000000",
+  "Facility reconstruction" = "#0072B2",
+  "AP-42 replication"       = "#D55E00"
+)
+
+series_linetypes <- c(
+  "EPA inventory"           = "solid",
+  "Facility reconstruction" = "longdash",
+  "AP-42 replication"       = "dotted"
+)
+
+series_shapes <- c(
+  "EPA inventory"           = 16,
+  "Facility reconstruction" = 17,
+  "AP-42 replication"       = 15
+)
+
+# ================================================================
+# 2. Shared publication theme
+# ================================================================
+
+theme_publication <- function(base_size = 10) {
+  theme_classic(
+    base_size = base_size,
+    base_family = "sans"
+  ) +
+    theme(
+      text = element_text(color = "black"),
+
+      axis.title = element_text(
+        size = base_size,
+        color = "black"
+      ),
+
+      axis.text = element_text(
+        size = base_size - 1,
+        color = "black"
+      ),
+
+      axis.ticks = element_line(
+        color = "black",
+        linewidth = 0.35
+      ),
+
+      axis.ticks.length = grid::unit(0.15, "cm"),
+
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.45
+      ),
+
+      panel.grid.major.y = element_line(
+        color = "grey88",
+        linewidth = 0.3
+      ),
+
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+
+      strip.background = element_rect(
+        fill = "grey95",
+        color = "black",
+        linewidth = 0.4
+      ),
+
+      strip.text = element_text(
+        size = base_size,
+        face = "bold",
+        color = "black",
+        margin = margin(
+          t = 4,
+          r = 4,
+          b = 4,
+          l = 4
+        )
+      ),
+
+      legend.position = "top",
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      legend.text = element_text(
+        size = base_size - 1
+      ),
+
+      legend.key.width = grid::unit(1.5, "cm"),
+      legend.key.height = grid::unit(0.45, "cm"),
+
+      legend.margin = margin(
+        t = 0,
+        r = 0,
+        b = 4,
+        l = 0
+      ),
+
+      legend.box.margin = margin(0, 0, 0, 0),
+
+      panel.spacing = grid::unit(0.7, "lines"),
+
+      plot.margin = margin(
+        t = 5,
+        r = 6,
+        b = 5,
+        l = 5
+      )
+    )
+}
+
+# ================================================================
+# 3. Panel (a): national totals
+# ================================================================
+
+# EPA national estimates
+# Original units: Tg/year
+epa_NOx_Tg <- c(
+  0.6, 1.2, 2.3, 4.4, 6.4, 7.3
+)
+
+epa_SO2_Tg <- c(
+  2.2, 4.1, 8.4, 15.8, 15.5, 14.2
+)
+
+# AP-42 emission factors × historical fuel consumption
+# Units: thousand short tons
+ap42_NOx_kst <- c(
+  541.4,
+  955.3,
+  1698.0,
+  3609.0,
+  4645.0,
+  5146.0
+)
+
+ap42_SO2_kst <- c(
+  3238.06,
+  5591.58,
+  9539.0,
+  13461.0,
+  14746.0,
+  14786.0
+)
+
+# Facility emission factors × reconstructed generation
+# Original units: short tons
+facility_NOx_st <- c(
+  15711.22,
+  180403.39,
+  1437056.85,
+  3508832.34,
+  6826420.75,
+  8308280.51
+)
+
+facility_SO2_st <- c(
+  13680.42,
+  173702.15,
+  1601738.14,
+  4129716.48,
+  8404806.81,
+  10255518.37
+)
+
+# Assemble national-total data
+figure1a_data <- bind_rows(
+  tibble(
+    year = decade_years,
+    pollutant = "NO[x]",
+    series = "EPA inventory",
+    emissions_kst = epa_NOx_Tg * Tg_to_kst
+  ),
+
+  tibble(
+    year = decade_years,
+    pollutant = "SO[2]",
+    series = "EPA inventory",
+    emissions_kst = epa_SO2_Tg * Tg_to_kst
+  ),
+
+  tibble(
+    year = decade_years,
+    pollutant = "NO[x]",
+    series = "Facility reconstruction",
+    emissions_kst = facility_NOx_st / 1000
+  ),
+
+  tibble(
+    year = decade_years,
+    pollutant = "SO[2]",
+    series = "Facility reconstruction",
+    emissions_kst = facility_SO2_st / 1000
+  ),
+
+  tibble(
+    year = decade_years,
+    pollutant = "NO[x]",
+    series = "AP-42 replication",
+    emissions_kst = ap42_NOx_kst
+  ),
+
+  tibble(
+    year = decade_years,
+    pollutant = "SO[2]",
+    series = "AP-42 replication",
+    emissions_kst = ap42_SO2_kst
+  )
+) %>%
+  mutate(
+    pollutant = factor(
+      pollutant,
+      levels = c("NO[x]", "SO[2]")
+    ),
+
+    series = factor(
+      series,
+      levels = series_levels
+    )
+  )
+
+# Data checks
+stopifnot(
+  nrow(figure1a_data) == 36,
+  !anyNA(figure1a_data),
+  all(figure1a_data$emissions_kst >= 0)
+)
+
+# Draw panel (a)
+figure1a <- ggplot(
+  figure1a_data,
+  aes(
+    x = year,
+    y = emissions_kst,
+    color = series,
+    linetype = series,
+    shape = series,
+    group = series
+  )
+) +
+  geom_line(
+    linewidth = 0.85
+  ) +
+  geom_point(
+    size = 2.3,
+    stroke = 0.4
+  ) +
+  facet_wrap(
+    ~pollutant,
+    nrow = 1,
+    scales = "free_y",
+    labeller = label_parsed
+  ) +
+  scale_color_manual(
+    values = series_colors,
+    breaks = series_levels,
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = series_linetypes,
+    breaks = series_levels,
+    name = NULL
+  ) +
+  scale_shape_manual(
+    values = series_shapes,
+    breaks = series_levels,
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = decade_years,
+    limits = c(1938, 1992),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_continuous(
+    labels = label_comma(accuracy = 1),
+    expand = expansion(mult = c(0.02, 0.07))
+  ) +
+  labs(
+    x = "Year",
+    y = expression(
+      "Emissions (" * 10^3 * " short tons)"
+    )
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    ),
+    linetype = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    ),
+    shape = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    )
+  ) +
+  theme_publication(base_size = 10)
+
+# ================================================================
+# 4. Panel (b): fuel-specific comparison
+# ================================================================
+
+# AP-42 replication
+# Units: thousand short tons
+ap42_fuel_NOx <- tribble(
+  ~year, ~Coal, ~Gas, ~Oil,
+  1940,   424,   32.8,  31.6,
+  1950,   707,   69.2,  82.5,
+  1960,  1256,  157.0, 112.0,
+  1970,  2396,  258.0, 581.0,
+  1980,  3687,  236.0, 267.0,
+  1990,  4119,  284.0, 239.0
+)
+
+ap42_fuel_SO2 <- tribble(
+  ~year, ~Coal, ~Gas, ~Oil,
+  1940,  3034,  4.06,  200,
+  1950,  5061,  8.58,  522,
+  1960,  8990, 19.40,  635,
+  1970, 16047, 32.00, 2759,
+  1980, 21441, 29.30,  846,
+  1990, 20760, 35.30,  757
+)
+
+# Facility reconstruction
+# Original units: short tons
+facility_fuel_NOx <- tribble(
+  ~year, ~Coal,       ~Gas,        ~Oil,
+  1940,    7045.041,    4573.998,   2917.729,
+  1950,   91986.108,   54784.042,  26904.508,
+  1960,  862310.000,  468049.377,  84132.975,
+  1970, 1958897.203, 1271091.324, 239153.245,
+  1980, 3944169.566, 2273862.352, 550361.046,
+  1990, 4994699.300, 2591613.430, 588748.474
+) %>%
+  mutate(
+    across(
+      c(Coal, Gas, Oil),
+      ~ .x / 1000
+    )
+  )
+
+facility_fuel_SO2 <- tribble(
+  ~year, ~Coal,       ~Gas,        ~Oil,
+  1940,    6926.576,    3750.932,   2181.855,
+  1950,   97930.037,   46433.023,  24406.123,
+  1960, 1042583.441,  449571.155,  92928.969,
+  1970, 2508211.294, 1335791.562, 255833.703,
+  1980, 5281662.366, 2466013.190, 612720.370,
+  1990, 6739414.332, 2755807.952, 655707.334
+) %>%
+  mutate(
+    across(
+      c(Coal, Gas, Oil),
+      ~ .x / 1000
+    )
+  )
+
+# Reshape helper
+reshape_fuel_data <- function(
+    data,
+    pollutant_name,
+    series_name
+) {
+  data %>%
+    pivot_longer(
+      cols = c(Coal, Gas, Oil),
+      names_to = "fuel",
+      values_to = "emissions_kst"
+    ) %>%
+    mutate(
+      pollutant = pollutant_name,
+      series = series_name
+    )
+}
+
+# Assemble fuel-specific data
+figure1b_data <- bind_rows(
+  reshape_fuel_data(
+    ap42_fuel_NOx,
+    "NO[x]",
+    "AP-42 replication"
+  ),
+
+  reshape_fuel_data(
+    ap42_fuel_SO2,
+    "SO[2]",
+    "AP-42 replication"
+  ),
+
+  reshape_fuel_data(
+    facility_fuel_NOx,
+    "NO[x]",
+    "Facility reconstruction"
+  ),
+
+  reshape_fuel_data(
+    facility_fuel_SO2,
+    "SO[2]",
+    "Facility reconstruction"
+  )
+) %>%
+  mutate(
+    pollutant = factor(
+      pollutant,
+      levels = c("NO[x]", "SO[2]")
+    ),
+
+    fuel = factor(
+      fuel,
+      levels = c("Coal", "Gas", "Oil")
+    ),
+
+    series = factor(
+      series,
+      levels = series_levels
+    )
+  )
+
+# Data checks
+stopifnot(
+  nrow(figure1b_data) == 72,
+  !anyNA(figure1b_data),
+  all(figure1b_data$emissions_kst >= 0)
+)
+
+# Draw panel (b)
+figure1b <- ggplot(
+  figure1b_data,
+  aes(
+    x = year,
+    y = emissions_kst,
+    color = series,
+    linetype = series,
+    shape = series,
+    group = series
+  )
+) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  geom_point(
+    size = 2,
+    stroke = 0.4
+  ) +
+  facet_grid(
+    pollutant ~ fuel,
+    scales = "free_y",
+    labeller = label_parsed
+  ) +
+  scale_color_manual(
+    values = series_colors,
+    breaks = c(
+      "Facility reconstruction",
+      "AP-42 replication"
+    ),
+    name = NULL,
+    drop = TRUE
+  ) +
+  scale_linetype_manual(
+    values = series_linetypes,
+    breaks = c(
+      "Facility reconstruction",
+      "AP-42 replication"
+    ),
+    name = NULL,
+    drop = TRUE
+  ) +
+  scale_shape_manual(
+    values = series_shapes,
+    breaks = c(
+      "Facility reconstruction",
+      "AP-42 replication"
+    ),
+    name = NULL,
+    drop = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = decade_years,
+    limits = c(1938, 1992),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_continuous(
+    labels = label_comma(accuracy = 1),
+    expand = expansion(mult = c(0.02, 0.08))
+  ) +
+  labs(
+    x = "Year",
+    y = expression(
+      "Emissions (" * 10^3 * " short tons)"
+    )
+  ) +
+  theme_publication(base_size = 9) +
+  theme(
+    legend.position = "none",
+
+    panel.spacing.x = grid::unit(
+      0.65,
+      "lines"
+    ),
+
+    panel.spacing.y = grid::unit(
+      0.6,
+      "lines"
+    ),
+
+    axis.text.x = element_text(
+      size = 7.5
+    )
+  )
+
+# ================================================================
+# 5. Combine panels (a) and (b)
+# ================================================================
+
+figure1_combined <- patchwork::wrap_plots(
+  figure1a,
+  figure1b,
+  ncol = 1,
+  heights = c(0.78, 1.22)
+) +
+  patchwork::plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")",
+    theme = theme(
+      plot.tag = element_text(
+        family = "sans",
+        face = "bold",
+        size = 11,
+        color = "black"
+      ),
+
+      plot.tag.position = c(
+        0.002,
+        0.998
+      ),
+
+      plot.margin = margin(
+        t = 5,
+        r = 5,
+        b = 5,
+        l = 5
+      )
+    )
+  )
+
+# Display final figure
+print(figure1_combined)
+
+# ================================================================
+# 6. Save final Figure 1
+# ================================================================
+
+# TIFF: 600 dpi
+ggsave(
+  filename = file.path(
+    output_dir,
+    "Figure_1_historical_emissions_comparison.tiff"
+  ),
+  plot = figure1_combined,
+  width = 7.4,
+  height = 8.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+# PDF: vector format
+ggsave(
+  filename = file.path(
+    output_dir,
+    "Figure_1_historical_emissions_comparison.pdf"
+  ),
+  plot = figure1_combined,
+  width = 7.4,
+  height = 8.6,
+  units = "in",
+  device = "pdf",
+  bg = "white"
+)
+
+message(
+  "Figure 1 saved to: ",
+  normalizePath(output_dir)
+)
