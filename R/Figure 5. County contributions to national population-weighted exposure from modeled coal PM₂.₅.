@@ -1,0 +1,514 @@
+#!/usr/bin/env Rscript
+
+# ================================================================
+# Figure 5: county contributions to national population-weighted
+# exposure from modeled coal PM2.5, 1940–1990
+#
+# (a) County-level contributions by analysis year
+# (b) Ten counties and states with the largest contributions in 1990
+# ================================================================
+
+rm(list = ls(all.names = TRUE))
+graphics.off()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(sf)
+  library(ggplot2)
+  library(scales)
+  library(USAboundaries)
+  library(grid)
+  library(gridExtra)
+})
+
+# ------------------------------
+# 0. Settings
+# ------------------------------
+
+FIG5_YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
+FIG5_TOP_YEAR <- 1990
+FIG5_TOP_N <- 10
+FIG5_MAP_CAP_QUANTILE <- 0.99
+
+FIG5_BASE_DIR <- paste0(
+  "/scratch/xshan2/R_Code/disperseR/main/output/",
+  "pm25_decades_model.lm.cv_single_poly_proxy1999met"
+)
+
+FIG5_DATA_DIR <- file.path(
+  FIG5_BASE_DIR,
+  "pwe_outputs_decades_FULL_NOcap_NOwhite"
+)
+
+FIG5_COUNTY_FILE <- file.path(
+  FIG5_DATA_DIR,
+  "county_pm25_pop_all_years.csv"
+)
+
+FIG5_OUT_DIR <- file.path(FIG5_BASE_DIR, "figures_revised")
+dir.create(FIG5_OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+FIG5_CRS <- paste0(
+  "+proj=aea +lat_1=20 +lat_2=60 ",
+  "+lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 ",
+  "+ellps=GRS80 +datum=NAD83 +units=m"
+)
+
+FIG5_WIDTH <- 7.4
+FIG5_HEIGHT <- 8.0
+FIG5_DPI <- 600
+
+if (!file.exists(FIG5_COUNTY_FILE)) {
+  stop(
+    "County PWE contribution file not found:\n",
+    FIG5_COUNTY_FILE,
+    "\nRun PWE_county_1940_1990_with_Fig2B.R first."
+  )
+}
+
+message("Figure 5 input: ", FIG5_COUNTY_FILE)
+message("Figure 5 output directory: ", FIG5_OUT_DIR)
+
+# ------------------------------
+# 1. Helper functions
+# ------------------------------
+
+fig5_geoid5 <- function(x) {
+  x <- gsub("\\D", "", as.character(x))
+  sprintf("%05d", as.integer(x))
+}
+
+fig5_theme <- function(base_size = 10) {
+  theme_classic(base_size = base_size, base_family = "sans") +
+    theme(
+      text = element_text(color = "black"),
+      axis.title = element_text(size = base_size, color = "black"),
+      axis.text = element_text(size = base_size - 1, color = "black"),
+      axis.ticks = element_line(color = "black", linewidth = 0.35),
+      axis.ticks.length = unit(0.14, "cm"),
+      panel.border = element_rect(
+        color = "black", fill = NA, linewidth = 0.45
+      ),
+      panel.grid.major.x = element_line(color = "grey88", linewidth = 0.3),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(6, 7, 6, 7)
+    )
+}
+
+# ------------------------------
+# 2. Read and validate county contribution data
+# ------------------------------
+
+fig5_county_dt <- fread(FIG5_COUNTY_FILE)
+
+required_columns <- c(
+  "geoid", "year", "state_abbr", "county_name", "contrib_nat"
+)
+missing_columns <- setdiff(required_columns, names(fig5_county_dt))
+
+if (length(missing_columns) > 0) {
+  stop(
+    "County contribution file is missing columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+fig5_county_dt[, geoid := fig5_geoid5(geoid)]
+fig5_county_dt[, year := as.integer(year)]
+fig5_county_dt[, contrib_nat := as.numeric(contrib_nat)]
+fig5_county_dt <- fig5_county_dt[
+  year %in% FIG5_YEARS & is.finite(contrib_nat) & !is.na(contrib_nat)
+]
+
+# Contributions cannot be negative.
+fig5_county_dt[contrib_nat < 0, contrib_nat := 0]
+
+if (nrow(fig5_county_dt) == 0) {
+  stop("No valid county contribution records were found.")
+}
+
+missing_years <- setdiff(FIG5_YEARS, sort(unique(fig5_county_dt$year)))
+if (length(missing_years) > 0) {
+  stop("Missing analysis years: ", paste(missing_years, collapse = ", "))
+}
+
+message("County-year rows loaded: ", nrow(fig5_county_dt))
+
+# ------------------------------
+# 3. Prepare county and state geometry
+# ------------------------------
+
+fig5_counties_sf <- USAboundaries::us_counties()
+fig5_counties_sf <- fig5_counties_sf[, !duplicated(names(fig5_counties_sf))]
+
+if (!"state_abbr" %in% names(fig5_counties_sf) &&
+    "stusps" %in% names(fig5_counties_sf)) {
+  fig5_counties_sf$state_abbr <- fig5_counties_sf$stusps
+}
+
+fig5_counties_sf <- fig5_counties_sf[
+  !(fig5_counties_sf$state_abbr %in% c("AK", "HI", "PR")),
+]
+fig5_counties_sf$geoid <- fig5_geoid5(fig5_counties_sf$geoid)
+fig5_counties_sf <- st_transform(fig5_counties_sf, FIG5_CRS)
+
+fig5_states_sf <- USAboundaries::us_states()
+fig5_states_sf <- fig5_states_sf[
+  fig5_states_sf$name %in%
+    c(setdiff(state.name, c("Alaska", "Hawaii")), "District of Columbia"),
+]
+fig5_states_sf <- st_transform(fig5_states_sf, st_crs(fig5_counties_sf))
+
+# Build a complete county-by-year panel so that every CONUS county appears
+# in every map. Missing county-year contributions are explicitly set to zero.
+fig5_map_values <- fig5_county_dt[
+  , .(contrib_nat = sum(contrib_nat, na.rm = TRUE)),
+  by = .(geoid, year)
+]
+
+fig5_complete_panel <- data.table::CJ(
+  geoid = unique(fig5_counties_sf$geoid),
+  year = FIG5_YEARS,
+  unique = TRUE
+)
+
+fig5_complete_panel <- merge(
+  fig5_complete_panel,
+  fig5_map_values,
+  by = c("geoid", "year"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+fig5_complete_panel[
+  is.na(contrib_nat) | !is.finite(contrib_nat),
+  contrib_nat := 0
+]
+
+fig5_complete_panel[contrib_nat < 0, contrib_nat := 0]
+
+fig5_map_sf <- merge(
+  fig5_counties_sf,
+  as.data.frame(fig5_complete_panel),
+  by = "geoid",
+  all = FALSE
+)
+
+fig5_map_sf$year <- factor(
+  fig5_map_sf$year,
+  levels = FIG5_YEARS,
+  labels = FIG5_YEARS
+)
+
+# ------------------------------
+# 4. Shared county-map color scale
+# ------------------------------
+
+positive_contributions <- fig5_complete_panel[contrib_nat > 0, contrib_nat]
+
+fig5_raw_map_cap <- as.numeric(
+  quantile(
+    positive_contributions,
+    probs = FIG5_MAP_CAP_QUANTILE,
+    na.rm = TRUE,
+    names = FALSE
+  )
+)
+
+if (!is.finite(fig5_raw_map_cap) || fig5_raw_map_cap <= 0) {
+  fig5_raw_map_cap <- max(fig5_complete_panel$contrib_nat, na.rm = TRUE)
+}
+
+# Express the legend in units of 10^-4 micrograms per cubic meter and round
+# the visual cap upward to a clean integer (e.g., 4.77 becomes 5).
+fig5_map_cap_scaled <- ceiling(fig5_raw_map_cap * 1e4)
+if (!is.finite(fig5_map_cap_scaled) || fig5_map_cap_scaled <= 0) {
+  fig5_map_cap_scaled <- 1
+}
+
+fig5_map_cap <- fig5_map_cap_scaled / 1e4
+fig5_map_sf$contrib_plot <- fig5_map_sf$contrib_nat * 1e4
+
+fig5_map_breaks_scaled <- unique(c(
+  0,
+  round(fig5_map_cap_scaled * 0.4, 1),
+  round(fig5_map_cap_scaled * 0.8, 1),
+  fig5_map_cap_scaled
+))
+
+fig5_map_label_text <- format(
+  fig5_map_breaks_scaled,
+  trim = TRUE,
+  scientific = FALSE
+)
+fig5_map_label_text[length(fig5_map_label_text)] <- paste0(
+  "phantom(0) >= ",
+  fig5_map_cap_scaled
+)
+fig5_map_labels <- parse(text = fig5_map_label_text)
+
+message(
+  "County contribution raw P99: ", signif(fig5_raw_map_cap, 5),
+  " | displayed cap: ", fig5_map_cap,
+  " (", fig5_map_cap_scaled, " x 10^-4)"
+)
+
+# ------------------------------
+# 5. Panel (a): county contribution maps
+# ------------------------------
+
+fig5_panel_a <- ggplot() +
+  geom_sf(
+    data = fig5_map_sf,
+    aes(fill = contrib_plot),
+    color = "grey72",
+    linewidth = 0.035
+  ) +
+  geom_sf(
+    data = fig5_states_sf,
+    inherit.aes = FALSE,
+    fill = NA,
+    color = "grey30",
+    linewidth = 0.16
+  ) +
+  facet_wrap(~year, ncol = 3, nrow = 2) +
+  scale_fill_viridis_c(
+    option = "C",
+    direction = 1,
+    trans = "sqrt",
+    limits = c(0, fig5_map_cap_scaled),
+    breaks = fig5_map_breaks_scaled,
+    labels = fig5_map_labels,
+    oob = scales::squish,
+    na.value = "#0D0887",
+    name = expression(
+      "Contribution to national PWE (" * 10^{-4} * " " *
+        mu * "g " * m^{-3} * ")"
+    ),
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(5.0, "cm"),
+      barheight = unit(0.32, "cm"),
+      ticks = TRUE
+    )
+  ) +
+  coord_sf(datum = NA) +
+  labs(title = "(a)") +
+  theme_void(base_size = 10, base_family = "sans") +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(
+      size = 11, face = "bold", hjust = 0,
+      margin = margin(t = 0, b = 3)
+    ),
+    strip.background = element_rect(
+      fill = "grey95", color = "black", linewidth = 0.4
+    ),
+    strip.text = element_text(
+      size = 9.5, face = "bold", color = "black",
+      margin = margin(3, 3, 3, 3)
+    ),
+    panel.spacing.x = unit(0.7, "lines"),
+    panel.spacing.y = unit(0.6, "lines"),
+    legend.position = "bottom",
+    legend.title = element_text(size = 9.2, color = "black"),
+    legend.text = element_text(size = 8.3, color = "black"),
+    legend.margin = margin(1, 0, 1, 0),
+    legend.box.spacing = unit(0.12, "cm"),
+    plot.margin = margin(4, 8, 1, 8)
+  )
+
+# ------------------------------
+# 6. Panel (b): top counties and states in 1990
+# ------------------------------
+
+fig5_county_top <- fig5_county_dt[
+  year == FIG5_TOP_YEAR,
+  .(contribution = sum(contrib_nat, na.rm = TRUE)),
+  by = .(geoid, county_name, state_abbr)
+][order(-contribution)]
+
+fig5_county_top <- head(fig5_county_top, FIG5_TOP_N)
+
+fig5_county_top[, label := paste0(county_name, ", ", state_abbr)]
+fig5_county_top[, label := factor(label, levels = rev(label))]
+
+fig5_state_top <- fig5_county_dt[
+  year == FIG5_TOP_YEAR,
+  .(contribution = sum(contrib_nat, na.rm = TRUE)),
+  by = state_abbr
+][order(-contribution)]
+
+fig5_state_top <- head(fig5_state_top, FIG5_TOP_N)
+
+fig5_state_top[, label := factor(state_abbr, levels = rev(state_abbr))]
+
+fwrite(
+  fig5_county_top,
+  file.path(FIG5_OUT_DIR, "Figure5_top_counties_1990.csv")
+)
+fwrite(
+  fig5_state_top,
+  file.path(FIG5_OUT_DIR, "Figure5_top_states_1990.csv")
+)
+
+fig5_county_bar <- ggplot(
+  fig5_county_top,
+  aes(x = contribution, y = label)
+) +
+  geom_col(width = 0.68, fill = "#3B6FB6") +
+  scale_x_continuous(
+    labels = label_number(accuracy = 0.001),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  labs(
+    tag = "(b)",
+    title = "Counties",
+    x = expression("Contribution to national PWE (" * mu * "g " * m^{-3} * ")"),
+    y = NULL
+  ) +
+  fig5_theme(base_size = 9.5) +
+  theme(
+    plot.title = element_text(size = 10.5, face = "bold", hjust = 0.5),
+    plot.tag = element_text(size = 11, face = "bold"),
+    plot.tag.position = c(0.015, 0.985),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(9, 6, 6, 9)
+  )
+
+fig5_state_bar <- ggplot(
+  fig5_state_top,
+  aes(x = contribution, y = label)
+) +
+  geom_col(width = 0.68, fill = "#3B6FB6") +
+  scale_x_continuous(
+    labels = label_number(accuracy = 0.005),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  labs(
+    title = "States",
+    x = expression("Contribution to national PWE (" * mu * "g " * m^{-3} * ")"),
+    y = NULL
+  ) +
+  fig5_theme(base_size = 9.5) +
+  theme(
+    plot.title = element_text(size = 10.5, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 8.3),
+    plot.margin = margin(9, 9, 6, 6)
+  )
+
+# Separate x axes prevent county bars from being compressed by state values.
+fig5_bottom_grob <- gridExtra::arrangeGrob(
+  fig5_county_bar,
+  grid::nullGrob(),
+  fig5_state_bar,
+  ncol = 3,
+  widths = c(1, 0.08, 1)
+)
+
+# ------------------------------
+# 7. Combine Figure 5
+# ------------------------------
+
+fig5_combined_grob <- gridExtra::arrangeGrob(
+  fig5_panel_a,
+  fig5_bottom_grob,
+  ncol = 1,
+  heights = c(1.48, 1),
+  padding = unit(0.12, "cm")
+)
+
+grid::grid.newpage()
+grid::grid.draw(fig5_combined_grob)
+
+# ------------------------------
+# 8. Save PDF, PNG, and TIFF
+# ------------------------------
+
+fig5_pdf_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.pdf")
+fig5_png_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.png")
+fig5_tiff_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.tiff")
+
+unlink(c(fig5_pdf_file, fig5_png_file, fig5_tiff_file))
+
+# PDF
+grDevices::pdf(
+  file = fig5_pdf_file,
+  width = FIG5_WIDTH,
+  height = FIG5_HEIGHT,
+  onefile = TRUE,
+  useDingbats = FALSE,
+  paper = "special",
+  bg = "white"
+)
+grid::grid.newpage()
+grid::grid.draw(fig5_combined_grob)
+invisible(grDevices::dev.off())
+Sys.sleep(1)
+fig5_pdf_saved <- file.exists(fig5_pdf_file) && file.info(fig5_pdf_file)$size > 0
+
+# PNG
+fig5_png_saved <- FALSE
+if (capabilities("cairo")) {
+  grDevices::png(
+    filename = fig5_png_file,
+    width = FIG5_WIDTH,
+    height = FIG5_HEIGHT,
+    units = "in",
+    res = FIG5_DPI,
+    type = "cairo",
+    bg = "white"
+  )
+  grid::grid.newpage()
+  grid::grid.draw(fig5_combined_grob)
+  invisible(grDevices::dev.off())
+  Sys.sleep(1)
+  fig5_png_saved <- file.exists(fig5_png_file) && file.info(fig5_png_file)$size > 0
+}
+
+if (!fig5_png_saved && fig5_pdf_saved && nzchar(Sys.which("pdftoppm"))) {
+  png_prefix <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions")
+  status <- system2(
+    Sys.which("pdftoppm"),
+    args = c(
+      "-png", "-r", as.character(FIG5_DPI), "-singlefile",
+      shQuote(fig5_pdf_file), shQuote(png_prefix)
+    )
+  )
+  Sys.sleep(1)
+  fig5_png_saved <- status == 0 &&
+    file.exists(fig5_png_file) && file.info(fig5_png_file)$size > 0
+}
+
+# TIFF
+fig5_tiff_saved <- FALSE
+if (capabilities("cairo")) {
+  grDevices::tiff(
+    filename = fig5_tiff_file,
+    width = FIG5_WIDTH,
+    height = FIG5_HEIGHT,
+    units = "in",
+    res = FIG5_DPI,
+    compression = "lzw",
+    type = "cairo",
+    bg = "white"
+  )
+  grid::grid.newpage()
+  grid::grid.draw(fig5_combined_grob)
+  invisible(grDevices::dev.off())
+  Sys.sleep(1)
+  fig5_tiff_saved <- file.exists(fig5_tiff_file) &&
+    file.info(fig5_tiff_file)$size > 0
+}
+
+if (fig5_pdf_saved) message("PDF saved: ", normalizePath(fig5_pdf_file))
+if (fig5_png_saved) message("PNG saved: ", normalizePath(fig5_png_file))
+if (fig5_tiff_saved) message("TIFF saved: ", normalizePath(fig5_tiff_file))
+if (!fig5_pdf_saved) warning("Figure 5 PDF was not generated.")
+if (!fig5_png_saved) warning("Figure 5 PNG was not generated.")
+if (!fig5_tiff_saved) warning("Figure 5 TIFF was not generated.")
+
+message("Figure 5 outputs are located in: ", FIG5_OUT_DIR)
