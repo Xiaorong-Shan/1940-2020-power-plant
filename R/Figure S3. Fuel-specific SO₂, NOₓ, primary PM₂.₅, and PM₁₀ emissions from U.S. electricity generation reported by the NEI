@@ -1,0 +1,321 @@
+#!/usr/bin/env Rscript
+
+# ================================================================
+# VERSION 2: restrained colorblind-safe five-fuel palette
+# Figure S3. NEI fuel-specific power-sector emissions, 2002-2024
+# SO2, NOx, primary PM2.5, and primary PM10
+# ================================================================
+
+rm(list = ls(all.names = TRUE))
+graphics.off()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+})
+
+# ----------------------------------------------------------------
+# 1. Locate the project and processed NEI data
+# ----------------------------------------------------------------
+
+project_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  ),
+  paste0(
+    "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  ),
+  paste0(
+    "C:/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  )
+)
+
+project_root <- project_roots[dir.exists(project_roots)][1]
+if (is.na(project_root)) stop("Cannot locate the 03_powerplant project folder.")
+
+processed_dir <- file.path(project_root, "data", "processed_modern_emissions")
+output_dir <- file.path(project_root, "Figure_plot")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+nei_csv_candidates <- c(
+  file.path(processed_dir, "nei_by_year_fuel_pollutant.csv"),
+  file.path(processed_dir, "Figure_S1_plot_data.csv")
+)
+
+nei_csv <- nei_csv_candidates[file.exists(nei_csv_candidates)][1]
+
+if (is.na(nei_csv)) {
+  stop(
+    "Processed NEI data were not found. First run the corrected Figure S1 ",
+    "data-preparation script. Expected:\n",
+    file.path(processed_dir, "nei_by_year_fuel_pollutant.csv")
+  )
+}
+
+message("NEI plotting data: ", nei_csv)
+nei_raw <- read_csv(nei_csv, show_col_types = FALSE)
+
+# ----------------------------------------------------------------
+# 2. Standardize pollutant and fuel names
+# ----------------------------------------------------------------
+
+normalize_pollutant <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- str_replace_all(x, "[._ ]", "-")
+  case_when(
+    x %in% c("SO2", "SO-2") ~ "SO2",
+    x %in% c("NOX", "NO-X") ~ "NOX",
+    x %in% c(
+      "PM25-PRI", "PM2-5-PRI", "PM2.5-PRI", "PM25PRI",
+      "PM25-PRIMARY", "PM2-5-PRIMARY"
+    ) ~ "PM25_PRI",
+    x %in% c(
+      "PM10-PRI", "PM10PRI", "PM10-PRIMARY"
+    ) ~ "PM10_PRI",
+    TRUE ~ NA_character_
+  )
+}
+
+value_column <- if ("emissions_Mt" %in% names(nei_raw)) {
+  "emissions_Mt"
+} else if ("value_Mt" %in% names(nei_raw)) {
+  "value_Mt"
+} else {
+  stop("The NEI file has neither emissions_Mt nor value_Mt.")
+}
+
+required_columns <- c("year", "fuel_group", "pollutant", value_column)
+missing_columns <- setdiff(required_columns, names(nei_raw))
+if (length(missing_columns) > 0) {
+  stop("Missing NEI columns: ", paste(missing_columns, collapse = ", "))
+}
+
+fuel_levels <- c("Coal", "Natural gas", "Oil", "Biomass", "Other")
+
+s3_data <- nei_raw %>%
+  transmute(
+    year = as.integer(year),
+    fuel_raw = trimws(as.character(fuel_group)),
+    pollutant_code = normalize_pollutant(pollutant),
+    emissions_Mt = suppressWarnings(as.numeric(.data[[value_column]]))
+  ) %>%
+  mutate(
+    fuel = case_when(
+      str_detect(fuel_raw, regex("^coal$", ignore_case = TRUE)) ~ "Coal",
+      str_detect(fuel_raw, regex("gas", ignore_case = TRUE)) ~ "Natural gas",
+      str_detect(fuel_raw, regex("oil|petroleum", ignore_case = TRUE)) ~ "Oil",
+      str_detect(fuel_raw, regex("biomass|wood", ignore_case = TRUE)) ~ "Biomass",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(
+    pollutant_code %in% c("SO2", "NOX", "PM25_PRI", "PM10_PRI"),
+    is.finite(year),
+    is.finite(emissions_Mt),
+    emissions_Mt >= 0
+  ) %>%
+  group_by(year, pollutant_code, fuel) %>%
+  summarise(emissions_Mt = sum(emissions_Mt), .groups = "drop") %>%
+  mutate(
+    # The upstream object is in million metric tons.
+    emissions_thousand_metric_tons = emissions_Mt * 1000,
+    fuel = factor(fuel, levels = fuel_levels),
+    pollutant = recode(
+      pollutant_code,
+      "SO2" = "SO[2]",
+      "NOX" = "NO[x]",
+      "PM25_PRI" = "Primary~PM[2.5]",
+      "PM10_PRI" = "Primary~PM[10]"
+    ),
+    pollutant = factor(
+      pollutant,
+      levels = c("SO[2]", "NO[x]", "Primary~PM[2.5]", "Primary~PM[10]")
+    )
+  ) %>%
+  arrange(pollutant, fuel, year)
+
+if (nrow(s3_data) == 0) {
+  stop("No usable SO2, NOx, PM2.5, or PM10 observations were found.")
+}
+
+pollutants_found <- unique(as.character(s3_data$pollutant))
+if (length(pollutants_found) < 4) {
+  warning(
+    "Only these pollutant panels were found: ",
+    paste(pollutants_found, collapse = ", "),
+    ". Figure_S1_plot_data.csv contains only SO2/NOx; use ",
+    "nei_by_year_fuel_pollutant.csv for all four panels."
+  )
+}
+
+write_csv(
+  s3_data,
+  file.path(processed_dir, "Figure_S3_NEI_plot_data.csv")
+)
+
+# ----------------------------------------------------------------
+# 3. Scientific visual design
+# ----------------------------------------------------------------
+
+# Coal remains the analytical focus. The remaining fuels use a restrained,
+# colorblind-safe palette plus distinct line types; this avoids both a rainbow
+# appearance and the poor separation caused by an all-grey palette.
+fuel_colors <- c(
+  "Coal" = "#A63603",
+  "Natural gas" = "#1F4E79",
+  "Oil" = "#B07D00",
+  "Biomass" = "#1B7F79",
+  "Other" = "#6B6B6B"
+)
+
+fuel_linetypes <- c(
+  "Coal" = "solid",
+  "Natural gas" = "longdash",
+  "Oil" = "dotdash",
+  "Biomass" = "dotted",
+  "Other" = "twodash"
+)
+
+fuel_linewidth <- c(
+  "Coal" = 1.10,
+  "Natural gas" = 0.85,
+  "Oil" = 0.85,
+  "Biomass" = 0.85,
+  "Other" = 0.80
+)
+
+year_min <- min(s3_data$year, na.rm = TRUE)
+year_max <- max(s3_data$year, na.rm = TRUE)
+
+fig_s3 <- ggplot(
+  s3_data,
+  aes(
+    x = year,
+    y = emissions_thousand_metric_tons,
+    color = fuel,
+    linetype = fuel,
+    linewidth = fuel,
+    group = fuel
+  )
+) +
+  geom_line(lineend = "round", na.rm = TRUE) +
+  facet_wrap(
+    ~ pollutant,
+    ncol = 2,
+    scales = "free_y",
+    labeller = label_parsed
+  ) +
+  scale_color_manual(
+    values = fuel_colors,
+    breaks = fuel_levels,
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = fuel_linetypes,
+    breaks = fuel_levels,
+    name = NULL
+  ) +
+  scale_linewidth_manual(
+    values = fuel_linewidth,
+    breaks = fuel_levels,
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = seq(2002, 2024, by = 4),
+    limits = c(year_min, year_max),
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 1, big.mark = ","),
+    expand = expansion(mult = c(0.02, 0.08))
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Emissions (10"^3*" metric tons)")
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 1,
+      byrow = TRUE,
+      override.aes = list(linewidth = c(1.1, 0.8, 0.8, 0.8, 0.8))
+    ),
+    linetype = guide_legend(nrow = 1, byrow = TRUE),
+    linewidth = "none"
+  ) +
+  theme_classic(base_size = 10.5, base_family = "sans") +
+  theme(
+    text = element_text(color = "black"),
+    axis.title = element_text(size = 10.5),
+    axis.text = element_text(size = 8.8, color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.35),
+    axis.ticks.length = grid::unit(0.12, "cm"),
+    panel.border = element_rect(
+      color = "black", fill = NA, linewidth = 0.45
+    ),
+    panel.grid.major.y = element_line(
+      color = "grey88", linewidth = 0.3
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(
+      fill = "grey94", color = "black", linewidth = 0.45
+    ),
+    strip.text = element_text(
+      size = 10.5,
+      face = "bold",
+      margin = margin(4, 4, 4, 4)
+    ),
+    panel.spacing = grid::unit(0.8, "lines"),
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.text = element_text(size = 9),
+    legend.key.width = grid::unit(1.15, "cm"),
+    legend.key.height = grid::unit(0.4, "cm"),
+    legend.margin = margin(0, 0, 3, 0),
+    plot.margin = margin(6, 8, 5, 7)
+  )
+
+print(fig_s3)
+
+# ----------------------------------------------------------------
+# 4. Save publication files
+# ----------------------------------------------------------------
+
+pdf_file <- file.path(output_dir, "Figure_S3_NEI_fuel_pollutant_emissions.pdf")
+png_file <- file.path(output_dir, "Figure_S3_NEI_fuel_pollutant_emissions.png")
+tiff_file <- file.path(output_dir, "Figure_S3_NEI_fuel_pollutant_emissions.tiff")
+
+ggsave(
+  pdf_file, fig_s3,
+  width = 7.4, height = 5.8, units = "in",
+  device = "pdf", useDingbats = FALSE, bg = "white"
+)
+
+ggsave(
+  png_file, fig_s3,
+  width = 7.4, height = 5.8, units = "in",
+  dpi = 600, bg = "white"
+)
+
+ggsave(
+  tiff_file, fig_s3,
+  width = 7.4, height = 5.8, units = "in",
+  dpi = 600, compression = "lzw", bg = "white"
+)
+
+message("Figure S3 PDF:  ", pdf_file)
+message("Figure S3 PNG:  ", png_file)
+message("Figure S3 TIFF: ", tiff_file)
+message(
+  "Figure S3 data: ",
+  file.path(processed_dir, "Figure_S3_NEI_plot_data.csv")
+)
+
