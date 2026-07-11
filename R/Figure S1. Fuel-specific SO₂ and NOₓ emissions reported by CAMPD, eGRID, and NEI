@@ -1,0 +1,696 @@
+#!/usr/bin/env Rscript
+
+# ================================================================
+# Figure S1: full data preparation and publication plot
+# Fuel-specific SO2 and NOx emissions from CAMPD, eGRID, and NEI
+# ================================================================
+
+rm(list = ls(all.names = TRUE))
+graphics.off()
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(janitor)
+  library(ggplot2)
+  library(scales)
+})
+
+# ------------------------------
+# 0. Locate the local project
+# ------------------------------
+
+candidate_project_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  ),
+  paste0(
+    "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  ),
+  paste0(
+    "C:/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  )
+)
+
+existing_roots <- candidate_project_roots[dir.exists(candidate_project_roots)]
+if (length(existing_roots) == 0) {
+  stop("Cannot locate the local 03_powerplant project directory.")
+}
+
+PROJECT_ROOT <- existing_roots[1]
+DATA_ROOT <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "Figure_plot")
+PROCESSED_DIR <- file.path(DATA_ROOT, "processed_modern_emissions")
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PROCESSED_DIR, recursive = TRUE, showWarnings = FALSE)
+
+message("Project root: ", PROJECT_ROOT)
+message("Data root: ", DATA_ROOT)
+
+# ------------------------------
+# 1. General helpers
+# ------------------------------
+
+to_numeric_clean <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A", "na", "n/a", "--", ".")] <- NA_character_
+  x <- gsub(",", "", x, fixed = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+first_matching_column <- function(column_names, patterns, required = TRUE) {
+  for (pattern in patterns) {
+    hit <- column_names[str_detect(column_names, regex(pattern, ignore_case = TRUE))]
+    if (length(hit) > 0) return(hit[1])
+  }
+  if (required) {
+    stop("No column matched: ", paste(patterns, collapse = " | "))
+  }
+  NA_character_
+}
+
+map_fuel_group <- function(x) {
+  lower <- tolower(as.character(x))
+  case_when(
+    str_detect(lower, "coal|bituminous|subbituminous|lignite") ~ "Coal",
+    str_detect(lower, "natural gas|gas|gaseous") ~ "Gas",
+    str_detect(lower, "oil|petroleum|diesel|distillate|residual") ~ "Oil",
+    str_detect(lower, "biomass|wood|waste|landfill") ~ "Biomass",
+    TRUE ~ "Other"
+  )
+}
+
+ST_TO_METRIC <- 0.907185
+LB_TO_METRIC_TON <- 0.00045359237
+
+# ================================================================
+# 2. CAMPD: 1980–2020 unit-level annual emissions
+# ================================================================
+
+legacy_campd_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production/",
+    "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+    "EF_pp_paper_code/data"
+  ),
+  paste0(
+    "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+    "EF_pp_paper_code/data"
+  )
+)
+
+campd_search_roots <- unique(c(
+  DATA_ROOT,
+  legacy_campd_roots[dir.exists(legacy_campd_roots)]
+))
+
+find_campd_files <- function(pattern) {
+  unique(unlist(lapply(
+    campd_search_roots,
+    list.files,
+    pattern = pattern,
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )))
+}
+
+campd_candidates <- find_campd_files(
+  "annual-emissions.*1980.*2020.*CAMPD.*\\.csv$"
+)
+
+if (length(campd_candidates) == 0) {
+  campd_candidates <- find_campd_files(
+    "annual-emissions.*unit.*CAMPD.*\\.csv$"
+  )
+}
+
+if (length(campd_candidates) == 0) {
+  stop(
+    "Cannot find a CAMPD annual unit-emissions CSV. Searched:\n",
+    paste(campd_search_roots, collapse = "\n")
+  )
+}
+
+# Prefer the file explicitly spanning 1980–2020.
+preferred_campd <- campd_candidates[
+  str_detect(basename(campd_candidates), regex("1980.*2020", ignore_case = TRUE))
+]
+CAMPD_FILE <- if (length(preferred_campd) > 0) preferred_campd[1] else campd_candidates[1]
+message("CAMPD file: ", CAMPD_FILE)
+
+campd_raw <- readr::read_csv(
+  CAMPD_FILE,
+  show_col_types = FALSE,
+  guess_max = 300000
+) %>%
+  janitor::clean_names()
+
+campd_names <- names(campd_raw)
+campd_year_col <- first_matching_column(campd_names, c("^year$"))
+campd_fuel_col <- first_matching_column(
+  campd_names,
+  c("^primary_fuel_type$", "primary.*fuel", "fuel.*type")
+)
+campd_so2_col <- first_matching_column(
+  campd_names,
+  c("^so2_mass_short_tons$", "so2.*mass.*short.*tons")
+)
+campd_nox_col <- first_matching_column(
+  campd_names,
+  c("^nox_mass_short_tons$", "^n_ox_mass_short_tons$", "n.*ox.*mass.*short.*tons")
+)
+campd_co2_col <- first_matching_column(
+  campd_names,
+  c("^co2_mass_short_tons$", "co2.*mass.*short.*tons")
+)
+
+campd_standard <- campd_raw %>%
+  transmute(
+    year = as.integer(.data[[campd_year_col]]),
+    fuel_group = map_fuel_group(.data[[campd_fuel_col]]),
+    so2_short_tons = to_numeric_clean(.data[[campd_so2_col]]),
+    nox_short_tons = to_numeric_clean(.data[[campd_nox_col]]),
+    co2_short_tons = to_numeric_clean(.data[[campd_co2_col]])
+  ) %>%
+  filter(
+    is.finite(year),
+    fuel_group %in% c("Coal", "Gas", "Oil")
+  )
+
+campd_year_fuel <- campd_standard %>%
+  group_by(year, fuel_group) %>%
+  summarise(
+    so2_Mt = sum(so2_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
+    nox_Mt = sum(nox_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
+    co2_Gt = sum(co2_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e9,
+    .groups = "drop"
+  ) %>%
+  complete(
+    year,
+    fuel_group = c("Coal", "Gas", "Oil"),
+    fill = list(so2_Mt = 0, nox_Mt = 0, co2_Gt = 0)
+  ) %>%
+  arrange(year, fuel_group) %>%
+  mutate(dataset = "CAMPD")
+
+campd_year_total <- campd_year_fuel %>%
+  group_by(year) %>%
+  summarise(
+    so2_Mt = sum(so2_Mt, na.rm = TRUE),
+    nox_Mt = sum(nox_Mt, na.rm = TRUE),
+    co2_Gt = sum(co2_Gt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(dataset = "CAMPD")
+
+write_csv(campd_year_fuel, file.path(PROCESSED_DIR, "campd_by_year_fuel.csv"))
+write_csv(campd_year_total, file.path(PROCESSED_DIR, "campd_by_year_total.csv"))
+
+message("CAMPD year-fuel rows: ", nrow(campd_year_fuel))
+
+# ================================================================
+# 3. eGRID: historical plant files, 1998–2020
+# ================================================================
+
+EGRID_DIR <- file.path(DATA_ROOT, "egrid", "egrid_historical_files_1998-2020")
+if (!dir.exists(EGRID_DIR)) {
+  egrid_dirs <- list.dirs(DATA_ROOT, recursive = TRUE, full.names = TRUE)
+  egrid_dirs <- egrid_dirs[
+    str_detect(egrid_dirs, regex("egrid.*historical", ignore_case = TRUE))
+  ]
+  if (length(egrid_dirs) == 0) stop("Cannot locate the historical eGRID directory.")
+  EGRID_DIR <- egrid_dirs[1]
+}
+
+egrid_target_bases <- c(
+  "eGRID1998_plant", "eGRID1999_plant", "eGRID2000_plant",
+  "eGRID2004_plant", "eGRID2005_plant", "eGRID2007_plant",
+  "eGRID2009_data", "eGRID2010_Data", "eGRID2012_Data",
+  "eGRID2014_Data_v2", "egrid2016_data", "egrid2018_data_v2",
+  "egrid2019_data", "eGRID2020_Data_v2"
+)
+
+find_egrid_file <- function(base_name) {
+  files <- list.files(
+    EGRID_DIR,
+    pattern = paste0("^", base_name, "\\.(xls|xlsx)$"),
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  if (length(files) == 0) return(NA_character_)
+  files[1]
+}
+
+egrid_sheet_rule <- function(path, year) {
+  sheets <- excel_sheets(path)
+
+  if (year %in% c(1998, 1999, 2000)) {
+    desired <- sprintf("EGRDPLNT%02d", year %% 100)
+    skip <- 3
+  } else if (year == 2004) {
+    desired <- "EGRDPLNT04"
+    skip <- 5
+  } else if (year %in% c(2005, 2007, 2009, 2010, 2012)) {
+    desired <- sprintf("PLNT%02d", year %% 100)
+    skip <- 4
+  } else {
+    candidates <- sheets[str_detect(toupper(sheets), "PLNT|PLANT")]
+    desired <- if (length(candidates) > 0) candidates[1] else sheets[1]
+    skip <- 1
+  }
+
+  if (!(desired %in% sheets)) {
+    candidates <- sheets[str_detect(toupper(sheets), "PLNT|PLANT")]
+    desired <- if (length(candidates) > 0) candidates[1] else sheets[1]
+  }
+
+  list(sheet = desired, skip = skip)
+}
+
+read_egrid_file <- function(base_name) {
+  path <- find_egrid_file(base_name)
+  if (is.na(path)) {
+    warning("Missing eGRID file: ", base_name)
+    return(tibble())
+  }
+
+  year <- as.integer(str_extract(base_name, "\\d{4}"))
+  rule <- egrid_sheet_rule(path, year)
+  skip_candidates <- unique(c(rule$skip, pmax(0, rule$skip - 1), rule$skip + 1, 0:7))
+
+  accepted <- NULL
+  used_skip <- NA_integer_
+
+  for (skip_value in skip_candidates) {
+    attempt <- tryCatch(
+      read_excel(
+        path,
+        sheet = rule$sheet,
+        skip = skip_value,
+        col_types = "text",
+        guess_max = 100000
+      ) %>%
+        clean_names(),
+      error = function(e) NULL
+    )
+
+    if (is.null(attempt)) next
+    attempt_names <- names(attempt)
+
+    has_fuel <- any(str_detect(attempt_names, "^plprimfl|^plprmfl|^fuelb1|primary.*fuel"))
+    has_so2 <- any(str_detect(attempt_names, "^plso2an|so2.*annual"))
+    has_nox <- any(str_detect(attempt_names, "^plnoxan|nox.*annual"))
+    has_co2 <- any(str_detect(attempt_names, "^plco2an|co2.*annual"))
+
+    if (has_fuel && has_so2 && has_nox && has_co2) {
+      accepted <- attempt
+      used_skip <- skip_value
+      break
+    }
+  }
+
+  if (is.null(accepted)) {
+    warning("Could not identify eGRID columns for year ", year, ": ", basename(path))
+    return(tibble())
+  }
+
+  nms <- names(accepted)
+  fuel_col <- first_matching_column(
+    nms, c("^plprimfl", "^plprmfl", "^fuelb1", "primary.*fuel")
+  )
+  so2_col <- first_matching_column(nms, c("^plso2an", "so2.*annual"))
+  nox_col <- first_matching_column(nms, c("^plnoxan", "nox.*annual"))
+  co2_col <- first_matching_column(nms, c("^plco2an", "co2.*annual"))
+  hg_col <- first_matching_column(nms, c("^plhgan", "hg.*annual"), required = FALSE)
+
+  message(
+    "eGRID ", year,
+    ": ", basename(path),
+    " | sheet=", rule$sheet,
+    " | skip=", used_skip
+  )
+
+  accepted %>%
+    transmute(
+      # Use the integer parsed from the filename. Some eGRID workbooks
+      # contain their own character-valued `year` column, which would
+      # otherwise take precedence inside dplyr's data mask.
+      year = .env$year,
+      primary_fuel = .data[[fuel_col]],
+      so2_short_tons = to_numeric_clean(.data[[so2_col]]),
+      nox_short_tons = to_numeric_clean(.data[[nox_col]]),
+      co2_short_tons = to_numeric_clean(.data[[co2_col]]),
+      hg_lbs = if (!is.na(hg_col)) to_numeric_clean(.data[[hg_col]]) else NA_real_
+    )
+}
+
+egrid_raw <- bind_rows(lapply(egrid_target_bases, read_egrid_file))
+if (nrow(egrid_raw) == 0) stop("No eGRID files were successfully read.")
+
+egrid_standard <- egrid_raw %>%
+  mutate(fuel_group = map_fuel_group(primary_fuel)) %>%
+  filter(fuel_group %in% c("Coal", "Gas", "Oil"))
+
+egrid_by_year_fuel <- egrid_standard %>%
+  group_by(year, fuel_group) %>%
+  summarise(
+    so2_Mt = sum(so2_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
+    nox_Mt = sum(nox_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
+    co2_Gt = sum(co2_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e9,
+    hg_Mt = if (all(is.na(hg_lbs))) NA_real_ else
+      sum(hg_lbs, na.rm = TRUE) * LB_TO_METRIC_TON / 1e6,
+    .groups = "drop"
+  ) %>%
+  complete(
+    year,
+    fuel_group = c("Coal", "Gas", "Oil"),
+    fill = list(so2_Mt = 0, nox_Mt = 0, co2_Gt = 0)
+  ) %>%
+  arrange(year, fuel_group) %>%
+  mutate(dataset = "eGRID")
+
+egrid_by_year_total <- egrid_by_year_fuel %>%
+  group_by(year) %>%
+  summarise(
+    so2_Mt = sum(so2_Mt, na.rm = TRUE),
+    nox_Mt = sum(nox_Mt, na.rm = TRUE),
+    co2_Gt = sum(co2_Gt, na.rm = TRUE),
+    hg_Mt = if (all(is.na(hg_Mt))) NA_real_ else sum(hg_Mt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(dataset = "eGRID")
+
+write_csv(egrid_by_year_fuel, file.path(PROCESSED_DIR, "egrid_by_year_fuel.csv"))
+write_csv(egrid_by_year_total, file.path(PROCESSED_DIR, "egrid_by_year_total.csv"))
+
+message("eGRID year-fuel rows: ", nrow(egrid_by_year_fuel))
+
+# ================================================================
+# 4. NEI: National electric-generation emissions, 2002–2024
+# ================================================================
+
+NEI_FILE <- file.path(
+  DATA_ROOT,
+  "nei",
+  "national_state_tier1_sector_2002_2024_NEI_tons.xlsx"
+)
+
+if (!file.exists(NEI_FILE)) {
+  nei_candidates <- list.files(
+    DATA_ROOT,
+    pattern = "national.*state.*tier1.*sector.*NEI.*\\.xlsx$",
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  if (length(nei_candidates) == 0) stop("Cannot locate the national NEI Excel file.")
+  NEI_FILE <- nei_candidates[1]
+}
+
+nei_sheets <- excel_sheets(NEI_FILE)
+national_sheet <- nei_sheets[str_detect(nei_sheets, regex("^National$", ignore_case = TRUE))]
+if (length(national_sheet) == 0) {
+  national_sheet <- nei_sheets[str_detect(nei_sheets, regex("National", ignore_case = TRUE))]
+}
+if (length(national_sheet) == 0) stop("No National sheet was found in the NEI workbook.")
+
+message("NEI file: ", NEI_FILE, " | sheet=", national_sheet[1])
+
+nei_raw <- read_excel(
+  NEI_FILE,
+  sheet = national_sheet[1],
+  guess_max = 300000
+) %>%
+  clean_names()
+
+nei_names <- names(nei_raw)
+nei_tier_col <- first_matching_column(
+  nei_names,
+  c("^tier1description$", "tier1.*description", "tier.*description"),
+  required = FALSE
+)
+nei_sector_col <- first_matching_column(
+  nei_names,
+  c("^sector$", "sector.*description", "source.*sector")
+)
+nei_pollutant_col <- first_matching_column(
+  nei_names,
+  c("^pollutant$", "pollutant.*name")
+)
+nei_emission_cols <- nei_names[str_detect(nei_names, "^emissions_?\\d{4}$")]
+
+if (length(nei_emission_cols) == 0) {
+  stop("No emissionsYYYY columns were found in the NEI National sheet.")
+}
+
+nei_standard <- nei_raw %>%
+  mutate(
+    tier_text = if (!is.na(nei_tier_col)) as.character(.data[[nei_tier_col]]) else "",
+    sector_text = as.character(.data[[nei_sector_col]]),
+    pollutant = as.character(.data[[nei_pollutant_col]])
+  ) %>%
+  filter(
+    str_detect(tier_text, regex("Fuel Comb.*Elec.*Util", ignore_case = TRUE)) |
+      str_detect(sector_text, regex("Electric Generation", ignore_case = TRUE))
+  ) %>%
+  mutate(fuel_group = map_fuel_group(sector_text)) %>%
+  pivot_longer(
+    cols = all_of(nei_emission_cols),
+    names_to = "emission_year",
+    values_to = "emissions_short_tons",
+    values_transform = list(
+      emissions_short_tons = as.character
+    )
+  ) %>%
+  mutate(
+    year = as.integer(str_extract(emission_year, "\\d{4}")),
+    emissions_short_tons = to_numeric_clean(emissions_short_tons),
+    pollutant = toupper(trimws(pollutant))
+  ) %>%
+  filter(
+    is.finite(year),
+    fuel_group %in% c("Coal", "Gas", "Oil", "Biomass", "Other")
+  )
+
+nei_nat_egu_by_year_fuel_pollutant <- nei_standard %>%
+  group_by(year, fuel_group, pollutant) %>%
+  summarise(
+    emissions_Mt = sum(emissions_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
+    .groups = "drop"
+  ) %>%
+  complete(
+    year,
+    fuel_group = c("Coal", "Gas", "Oil", "Biomass", "Other"),
+    pollutant,
+    fill = list(emissions_Mt = 0)
+  ) %>%
+  arrange(year, fuel_group, pollutant) %>%
+  mutate(dataset = "NEI") %>%
+  select(year, fuel_group, pollutant, dataset, emissions_Mt)
+
+nei_nat_egu_by_year_total_pollutant <- nei_nat_egu_by_year_fuel_pollutant %>%
+  group_by(year, pollutant) %>%
+  summarise(
+    emissions_Mt = sum(emissions_Mt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(dataset = "NEI") %>%
+  select(year, pollutant, dataset, emissions_Mt)
+
+write_csv(
+  nei_nat_egu_by_year_fuel_pollutant,
+  file.path(PROCESSED_DIR, "nei_by_year_fuel_pollutant.csv")
+)
+write_csv(
+  nei_nat_egu_by_year_total_pollutant,
+  file.path(PROCESSED_DIR, "nei_by_year_total_pollutant.csv")
+)
+
+message("NEI year-fuel-pollutant rows: ", nrow(nei_nat_egu_by_year_fuel_pollutant))
+
+# ================================================================
+# 5. Save all reusable upstream objects
+# ================================================================
+
+saveRDS(campd_year_fuel, file.path(PROCESSED_DIR, "campd_year_fuel.rds"))
+saveRDS(campd_year_total, file.path(PROCESSED_DIR, "campd_year_total.rds"))
+saveRDS(egrid_by_year_fuel, file.path(PROCESSED_DIR, "egrid_by_year_fuel.rds"))
+saveRDS(egrid_by_year_total, file.path(PROCESSED_DIR, "egrid_by_year_total.rds"))
+saveRDS(
+  nei_nat_egu_by_year_fuel_pollutant,
+  file.path(PROCESSED_DIR, "nei_nat_egu_by_year_fuel_pollutant.rds")
+)
+saveRDS(
+  nei_nat_egu_by_year_total_pollutant,
+  file.path(PROCESSED_DIR, "nei_nat_egu_by_year_total_pollutant.rds")
+)
+
+# ================================================================
+# 6. Assemble Figure S1 plotting data
+# ================================================================
+
+s1_nei_long <- nei_nat_egu_by_year_fuel_pollutant %>%
+  filter(pollutant %in% c("SO2", "NOX")) %>%
+  transmute(
+    year,
+    dataset = "NEI",
+    fuel_group,
+    pollutant,
+    value_Mt = emissions_Mt
+  )
+
+s1_egrid_long <- egrid_by_year_fuel %>%
+  transmute(
+    year,
+    dataset = "eGRID",
+    fuel_group,
+    SO2 = so2_Mt,
+    NOX = nox_Mt
+  ) %>%
+  pivot_longer(
+    cols = c(SO2, NOX),
+    names_to = "pollutant",
+    values_to = "value_Mt"
+  )
+
+s1_campd_long <- campd_year_fuel %>%
+  transmute(
+    year,
+    dataset = "CAMPD",
+    fuel_group,
+    SO2 = so2_Mt,
+    NOX = nox_Mt
+  ) %>%
+  pivot_longer(
+    cols = c(SO2, NOX),
+    names_to = "pollutant",
+    values_to = "value_Mt"
+  )
+
+s1_plot_data <- bind_rows(s1_nei_long, s1_egrid_long, s1_campd_long) %>%
+  filter(
+    fuel_group %in% c("Coal", "Gas", "Oil"),
+    pollutant %in% c("SO2", "NOX"),
+    is.finite(value_Mt),
+    value_Mt >= 0
+  ) %>%
+  mutate(
+    dataset = factor(dataset, levels = c("CAMPD", "eGRID", "NEI")),
+    fuel_group = factor(fuel_group, levels = c("Coal", "Gas", "Oil")),
+    pollutant = recode(pollutant, "NOX" = "NO[x]", "SO2" = "SO[2]"),
+    pollutant = factor(pollutant, levels = c("NO[x]", "SO[2]"))
+  ) %>%
+  arrange(dataset, pollutant, fuel_group, year)
+
+write_csv(s1_plot_data, file.path(PROCESSED_DIR, "Figure_S1_plot_data.csv"))
+
+# ================================================================
+# 7. Draw Figure S1
+# ================================================================
+
+s1_colors <- c("CAMPD" = "#E69F00", "eGRID" = "#0072B2", "NEI" = "#009E73")
+s1_linetypes <- c("CAMPD" = "solid", "eGRID" = "dashed", "NEI" = "dotdash")
+s1_shapes <- c("CAMPD" = 16, "eGRID" = 15, "NEI" = 17)
+s1_year_breaks <- seq(
+  floor(min(s1_plot_data$year) / 10) * 10,
+  ceiling(max(s1_plot_data$year) / 10) * 10,
+  by = 10
+)
+
+figS1_plot <- ggplot(
+  s1_plot_data,
+  aes(
+    x = year,
+    y = value_Mt,
+    color = dataset,
+    linetype = dataset,
+    shape = dataset,
+    group = dataset
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8, stroke = 0.35) +
+  facet_grid(pollutant ~ fuel_group, labeller = label_parsed) +
+  scale_color_manual(values = s1_colors, name = NULL) +
+  scale_linetype_manual(values = s1_linetypes, name = NULL) +
+  scale_shape_manual(values = s1_shapes, name = NULL) +
+  scale_x_continuous(
+    breaks = s1_year_breaks,
+    limits = c(min(s1_plot_data$year) - 1, max(s1_plot_data$year) + 1),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 1, big.mark = ","),
+    expand = expansion(mult = c(0.02, 0.07))
+  ) +
+  labs(
+    x = "Year",
+    y = "Emissions (million metric tons)"
+  ) +
+  theme_classic(base_size = 10, base_family = "sans") +
+  theme(
+    text = element_text(color = "black"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8.5, color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.35),
+    axis.ticks.length = grid::unit(0.13, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.45),
+    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.4),
+    strip.text = element_text(
+      size = 9.5, face = "bold", color = "black",
+      margin = margin(3, 4, 3, 4)
+    ),
+    strip.text.y.right = element_text(angle = 270),
+    panel.spacing.x = grid::unit(0.65, "lines"),
+    panel.spacing.y = grid::unit(0.55, "lines"),
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.text = element_text(size = 9),
+    legend.key.width = grid::unit(1.25, "cm"),
+    legend.margin = margin(0, 0, 3, 0),
+    plot.margin = margin(5, 8, 5, 7)
+  )
+
+print(figS1_plot)
+
+# ================================================================
+# 8. Save Figure S1
+# ================================================================
+
+S1_PDF <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.pdf")
+S1_PNG <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.png")
+S1_TIFF <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.tiff")
+
+ggsave(S1_PDF, figS1_plot, width = 7.4, height = 4.8, units = "in", device = "pdf", bg = "white")
+ggsave(S1_PNG, figS1_plot, width = 7.4, height = 4.8, units = "in", dpi = 600, bg = "white")
+ggsave(
+  S1_TIFF,
+  figS1_plot,
+  width = 7.4,
+  height = 4.8,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+message("Figure S1 PDF: ", S1_PDF)
+message("Figure S1 PNG: ", S1_PNG)
+message("Figure S1 TIFF: ", S1_TIFF)
+message("Reusable processed data: ", PROCESSED_DIR)
+
