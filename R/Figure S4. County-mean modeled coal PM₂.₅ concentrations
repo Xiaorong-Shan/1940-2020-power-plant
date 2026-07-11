@@ -1,0 +1,188 @@
+#!/usr/bin/env Rscript
+
+# Figure S4 — VERSION 8 final; Hopper-safe >= legend symbol
+# Run this WHOLE file with source(). Do not run selected sections.
+
+local({
+  rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
+  graphics.off()
+
+  suppressPackageStartupMessages({
+    library(data.table)
+    library(sf)
+    library(USAboundaries)
+  })
+
+  root <- paste0(
+    "/scratch/xshan2/R_Code/disperseR/main/output/",
+    "pm25_decades_model.lm.cv_single_poly_proxy1999met"
+  )
+  input <- file.path(
+    root,
+    "pwe_outputs_decades_FULL_FINAL_hopperSafe",
+    "county_pm25_pop_all_years.csv"
+  )
+  out_dir <- file.path(root, "figures_revised")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  final_pdf <- file.path(out_dir, "Figure_S4_county_coal_PM25_maps.pdf")
+  final_png <- file.path(out_dir, "Figure_S4_county_coal_PM25_maps.png")
+  temp_pdf <- file.path(out_dir, "Figure_S4_RENDERING_TEMP.pdf")
+  years <- c(1940, 1950, 1960, 1970, 1980, 1990)
+  cap <- 0.5
+
+  unlink(c(final_pdf, final_png, temp_pdf))
+  if (!file.exists(input)) stop("Input not found: ", input)
+
+  fips5 <- function(x) {
+    x <- sub("\\.0+$", "", trimws(as.character(x)))
+    x <- gsub("[^0-9]", "", x)
+    n <- suppressWarnings(as.integer(x))
+    ifelse(is.na(n), NA_character_, sprintf("%05d", n))
+  }
+
+  # Data columns were already confirmed as year, geoid, and pm25.
+  d <- fread(input, select = c("year", "geoid", "pm25"))
+  d[, year := as.integer(year)]
+  d[, geoid := fips5(geoid)]
+  d[, pm25 := suppressWarnings(as.numeric(pm25))]
+  d <- d[year %in% years & !is.na(geoid)]
+  d[!is.finite(pm25) | pm25 < 0, pm25 := 0]
+  d <- d[, .(pm25 = mean(pm25, na.rm = TRUE)), by = .(year, geoid)]
+
+  if (nrow(d) < 18000) stop("Too few county-year rows: ", nrow(d))
+  if (max(d$pm25) <= 0) stop("All county PM2.5 values are zero.")
+
+  # Geometry; no st_make_valid(), so lwgeom is not required.
+  co <- USAboundaries::us_counties()
+  st <- USAboundaries::us_states()
+
+  fips_col <- intersect(c("geoid", "fips", "county_fips", "geoid10"), names(co))[1]
+  state_col <- intersect(c("name", "state_name"), names(st))[1]
+  if (is.na(fips_col) || is.na(state_col)) stop("Geometry ID columns not found.")
+
+  co$geoid_join <- fips5(co[[fips_col]])
+  co <- co[!substr(co$geoid_join, 1, 2) %in% c("02", "15", "72"), ]
+  st <- st[!st[[state_col]] %in% c("Alaska", "Hawaii", "Puerto Rico"), ]
+
+  crs_aea <- paste(
+    "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23",
+    "+lon_0=-96 +datum=NAD83 +units=m +no_defs"
+  )
+  co <- st_transform(co, crs_aea)
+  st <- st_transform(st, crs_aea)
+  if (nrow(co) < 3000) stop("Too few county geometries: ", nrow(co))
+
+  # Prepare six complete panels without creating a global map_sf object.
+  panel_list <- lapply(years, function(y) {
+    v <- d[year == y, .(geoid, pm25)]
+    m <- match(co$geoid_join, v$geoid)
+    z <- co
+    z$plot_pm25 <- v$pm25[m]
+    z$plot_pm25[is.na(z$plot_pm25)] <- 0
+    z
+  })
+
+  panel_max <- vapply(panel_list, function(z) max(z$plot_pm25), numeric(1))
+  if (all(panel_max == 0)) stop("All six mapped panels are zero.")
+
+  message("Rows read: ", nrow(d))
+  message("Counties per map: ", nrow(co))
+  message("Panel maxima: ", paste(round(panel_max, 3), collapse = ", "))
+
+  pal <- colorRampPalette(
+    c("#FFF7EC", "#FDD49E", "#FC8D59", "#E34A33", "#990000")
+  )(256)
+  cols <- function(x) {
+    i <- floor(pmax(0, pmin(x, cap)) / cap * 255) + 1
+    i[!is.finite(i)] <- 1
+    pal[i]
+  }
+
+  draw_all <- function() {
+    layout(
+      matrix(c(1:6, 7, 7, 7), nrow = 3, byrow = TRUE),
+      heights = c(1, 1, 0.32)
+    )
+
+    for (i in seq_along(years)) {
+      par(mar = c(0.1, 0.1, 1.3, 0.1), xaxs = "i", yaxs = "i")
+      plot(
+        st_geometry(panel_list[[i]]),
+        col = cols(panel_list[[i]]$plot_pm25),
+        border = "grey84", lwd = 0.08,
+        axes = FALSE, asp = 1
+      )
+      plot(
+        st_geometry(st), add = TRUE,
+        col = NA, border = "grey40", lwd = 0.42
+      )
+      title(main = years[i], font.main = 2, cex.main = 1.08, line = 0.2)
+    }
+
+    par(mar = c(1.35, 5.2, 1.25, 5.2))
+    x <- seq(0, cap, length.out = 256)
+    image(
+      x, c(0, 1), matrix(rep(x, 2), 256, 2),
+      col = pal, axes = FALSE, xlab = "", ylab = "", useRaster = TRUE
+    )
+    axis(
+      1, at = c(0, 0.1, 0.25, cap),
+      # Leave the final label blank; Unicode >= is not supported by the
+      # Hopper PDF font and otherwise becomes "...".
+      labels = c("0", "0.10", "0.25", ""),
+      cex.axis = 0.82, mgp = c(2.2, 0.35, 0), tck = -0.22
+    )
+    # Draw >=0.5 with plotmath, which is independent of font encoding.
+    mtext(
+      bquote(phantom(.) >= .(cap)),
+      side = 1,
+      at = cap,
+      line = 0.35,
+      cex = 0.82
+    )
+    box(col = "grey35", lwd = 0.5)
+    mtext(
+      expression("Coal PM"[2.5]~"("*mu*"g "*m^{-3}*")"),
+      3, line = 0.12, cex = 0.90, font = 2
+    )
+  }
+
+  # Draw to a temporary file. Only rename it after successful completion.
+  pdf(
+    temp_pdf, width = 7.4, height = 5.65,
+    onefile = TRUE, useDingbats = FALSE,
+    paper = "special", bg = "white"
+  )
+  draw_error <- tryCatch({
+    draw_all()
+    NULL
+  }, error = function(e) e)
+  invisible(dev.off())
+
+  if (!is.null(draw_error)) {
+    unlink(temp_pdf)
+    stop("Drawing stopped: ", conditionMessage(draw_error))
+  }
+  if (!file.exists(temp_pdf) || file.info(temp_pdf)$size < 10000) {
+    unlink(temp_pdf)
+    stop("Temporary PDF failed validation.")
+  }
+  if (!file.rename(temp_pdf, final_pdf)) stop("Could not finalize PDF.")
+
+  # The same pdftoppm route previously used successfully on Hopper.
+  converter <- Sys.which("pdftoppm")
+  png_ok <- FALSE
+  if (nzchar(converter)) {
+    prefix <- sub("\\.png$", "", final_png)
+    status <- system2(
+      converter,
+      c("-png", "-r", "600", "-singlefile", shQuote(final_pdf), shQuote(prefix))
+    )
+    Sys.sleep(1)
+    png_ok <- status == 0 && file.exists(final_png) && file.info(final_png)$size > 10000
+  }
+
+  message("PDF saved: TRUE | ", final_pdf)
+  message("PNG saved: ", png_ok, " | ", final_png)
+})
