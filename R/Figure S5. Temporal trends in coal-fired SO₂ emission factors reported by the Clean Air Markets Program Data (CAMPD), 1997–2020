@@ -1,0 +1,3092 @@
+# ======================================================================
+# CORRECTED CAMPD SO2 EMISSION-FACTOR DIAGNOSTIC
+#
+# Purpose:
+# 1. Correctly combine unit-year CAMPD facility attributes with
+#    facility-year annual emissions.
+# 2. Examine temporal changes in coal SO2 and NOx emission factors.
+# 3. Compare coal facilities with and without reported SO2 controls.
+# 4. Evaluate whether modern CAMPD-derived EFs may underestimate
+#    historical SO2 emissions.
+#
+# Important data structure:
+# - facility attributes: unit-year level
+# - annual emissions: facility-year level
+#
+# Therefore, unit attributes must first be aggregated to facility-year.
+# ======================================================================
+
+
+# ======================================================================
+# 0. CLEAN SESSION
+# ======================================================================
+
+rm(list = ls())
+
+options(
+  stringsAsFactors = FALSE,
+  scipen = 999
+)
+
+
+# ======================================================================
+# 1. PACKAGES
+# ======================================================================
+
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "ggplot2",
+  "readr",
+  "scales"
+)
+
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+invisible(
+  lapply(
+    required_packages,
+    library,
+    character.only = TRUE
+  )
+)
+
+
+# ======================================================================
+# 2. PROJECT PATHS
+# ======================================================================
+
+PROJECT_DIR <- file.path(
+  "/Users/xshan2",
+  "OneDrive - George Mason University - O365 Production",
+  "GMU_PhD",
+  "01_Research",
+  "02_2019fall_ADRD",
+  "prelim_analysis",
+  "PowerPlant",
+  "EF_pp_paper_code"
+)
+
+DATA_DIR <- file.path(
+  PROJECT_DIR,
+  "data"
+)
+
+OUTPUT_DIR <- file.path(
+  PROJECT_DIR,
+  "output",
+  "CAMPD_SO2_EF_diagnostic_corrected"
+)
+
+TABLE_DIR <- file.path(
+  OUTPUT_DIR,
+  "tables"
+)
+
+FIGURE_DIR <- file.path(
+  OUTPUT_DIR,
+  "figures"
+)
+
+QA_DIR <- file.path(
+  OUTPUT_DIR,
+  "qa"
+)
+
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  TABLE_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  FIGURE_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  QA_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+FACILITY_ATTRIBUTE_FILE <- file.path(
+  DATA_DIR,
+  "facility-attributes-1995-2020-CAMPD.csv"
+)
+
+ANNUAL_EMISSION_FILE <- file.path(
+  DATA_DIR,
+  "annual-emissions-facility-aggregation-1995-2020-CAMPD.csv"
+)
+
+
+cat("\n============================================================\n")
+cat("Corrected CAMPD SO2 diagnostic analysis\n")
+cat("============================================================\n\n")
+
+cat("Facility attributes:\n")
+cat(FACILITY_ATTRIBUTE_FILE, "\n\n")
+
+cat("Annual emissions:\n")
+cat(ANNUAL_EMISSION_FILE, "\n\n")
+
+cat("Output directory:\n")
+cat(OUTPUT_DIR, "\n\n")
+
+
+missing_files <- c(
+  FACILITY_ATTRIBUTE_FILE,
+  ANNUAL_EMISSION_FILE
+)
+
+missing_files <- missing_files[
+  !file.exists(missing_files)
+]
+
+if (length(missing_files) > 0) {
+  stop(
+    paste0(
+      "The following files were not found:\n\n",
+      paste(
+        missing_files,
+        collapse = "\n"
+      )
+    )
+  )
+}
+
+
+# ======================================================================
+# 3. HELPER FUNCTIONS
+# ======================================================================
+
+clean_names_simple <- function(x) {
+  
+  x %>%
+    stringr::str_trim() %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all(
+      "[^a-z0-9]+",
+      "_"
+    ) %>%
+    stringr::str_replace_all(
+      "^_+|_+$",
+      ""
+    )
+}
+
+
+safe_numeric <- function(x) {
+  
+  suppressWarnings(
+    as.numeric(
+      stringr::str_replace_all(
+        as.character(x),
+        ",",
+        ""
+      )
+    )
+  )
+}
+
+
+safe_first <- function(x) {
+  
+  x_nonmissing <- x[
+    !is.na(x) &
+      as.character(x) != ""
+  ]
+  
+  if (length(x_nonmissing) == 0) {
+    return(NA)
+  }
+  
+  x_nonmissing[1]
+}
+
+
+safe_ratio <- function(numerator, denominator) {
+  
+  if (
+    !is.finite(numerator) ||
+    !is.finite(denominator) ||
+    denominator == 0
+  ) {
+    return(NA_real_)
+  }
+  
+  numerator / denominator
+}
+
+
+weighted_median_safe <- function(x, w) {
+  
+  valid <- (
+    is.finite(x) &
+      is.finite(w) &
+      w > 0
+  )
+  
+  x <- x[valid]
+  w <- w[valid]
+  
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+  
+  ord <- order(x)
+  
+  x <- x[ord]
+  w <- w[ord]
+  
+  cumulative_weight <- cumsum(w) / sum(w)
+  
+  x[
+    which(cumulative_weight >= 0.5)[1]
+  ]
+}
+
+
+write_table <- function(data, filename) {
+  
+  readr::write_csv(
+    data,
+    file.path(
+      TABLE_DIR,
+      filename
+    ),
+    na = ""
+  )
+}
+
+
+save_plot <- function(
+    plot_object,
+    filename,
+    width = 8,
+    height = 5.5) {
+  
+  ggsave(
+    filename = file.path(
+      FIGURE_DIR,
+      filename
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = 400,
+    bg = "white",
+    device = "png"
+  )
+  
+  pdf_filename <- stringr::str_replace(
+    filename,
+    "\\.png$",
+    ".pdf"
+  )
+  
+  ggsave(
+    filename = file.path(
+      FIGURE_DIR,
+      pdf_filename
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    bg = "white",
+    device = "pdf"
+  )
+}
+
+
+# ======================================================================
+# 4. READ RAW CAMPD FILES
+# ======================================================================
+
+facility_raw <- data.table::fread(
+  file = FACILITY_ATTRIBUTE_FILE,
+  na.strings = c(
+    "",
+    "NA",
+    "N/A",
+    "NULL",
+    ".",
+    "-"
+  ),
+  check.names = FALSE
+)
+
+emission_raw <- data.table::fread(
+  file = ANNUAL_EMISSION_FILE,
+  na.strings = c(
+    "",
+    "NA",
+    "N/A",
+    "NULL",
+    ".",
+    "-"
+  ),
+  check.names = FALSE
+)
+
+
+cat("Raw facility attribute dimensions:\n")
+print(dim(facility_raw))
+
+cat("\nRaw annual emission dimensions:\n")
+print(dim(emission_raw))
+
+
+# ======================================================================
+# 5. CLEAN COLUMN NAMES
+# ======================================================================
+
+facility_original_names <- names(
+  facility_raw
+)
+
+facility_clean_names <- make.unique(
+  clean_names_simple(
+    facility_original_names
+  ),
+  sep = "_duplicate_"
+)
+
+data.table::setnames(
+  facility_raw,
+  old = facility_original_names,
+  new = facility_clean_names
+)
+
+
+emission_original_names <- names(
+  emission_raw
+)
+
+emission_clean_names <- make.unique(
+  clean_names_simple(
+    emission_original_names
+  ),
+  sep = "_duplicate_"
+)
+
+data.table::setnames(
+  emission_raw,
+  old = emission_original_names,
+  new = emission_clean_names
+)
+
+
+column_crosswalk <- bind_rows(
+  data.frame(
+    source_file = "facility_attributes",
+    original_column = facility_original_names,
+    cleaned_column = facility_clean_names
+  ),
+  data.frame(
+    source_file = "annual_emissions",
+    original_column = emission_original_names,
+    cleaned_column = emission_clean_names
+  )
+)
+
+readr::write_csv(
+  column_crosswalk,
+  file.path(
+    QA_DIR,
+    "column_name_crosswalk.csv"
+  )
+)
+
+
+# ======================================================================
+# 6. STANDARDIZE KEY COLUMNS
+# ======================================================================
+
+required_facility_columns <- c(
+  "facility_id",
+  "unit_id",
+  "year",
+  "primary_fuel_type",
+  "so2_controls"
+)
+
+required_emission_columns <- c(
+  "facility_id",
+  "year",
+  "gross_load_mwh",
+  "so2_mass_short_tons",
+  "nox_mass_short_tons",
+  "heat_input_mmbtu"
+)
+
+
+# Allow for the names already used in the user's current environment
+
+if (
+  !"facility_id" %in% names(facility_raw) &&
+  "facility_id_merge" %in% names(facility_raw)
+) {
+  data.table::setnames(
+    facility_raw,
+    "facility_id_merge",
+    "facility_id"
+  )
+}
+
+if (
+  !"year" %in% names(facility_raw) &&
+  "facility_year_merge" %in% names(facility_raw)
+) {
+  data.table::setnames(
+    facility_raw,
+    "facility_year_merge",
+    "year"
+  )
+}
+
+if (
+  !"facility_id" %in% names(emission_raw) &&
+  "facility_id_merge" %in% names(emission_raw)
+) {
+  data.table::setnames(
+    emission_raw,
+    "facility_id_merge",
+    "facility_id"
+  )
+}
+
+
+missing_facility_columns <- setdiff(
+  required_facility_columns,
+  names(facility_raw)
+)
+
+missing_emission_columns <- setdiff(
+  required_emission_columns,
+  names(emission_raw)
+)
+
+if (length(missing_facility_columns) > 0) {
+  stop(
+    paste0(
+      "Missing required facility columns:\n",
+      paste(
+        missing_facility_columns,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+if (length(missing_emission_columns) > 0) {
+  stop(
+    paste0(
+      "Missing required emissions columns:\n",
+      paste(
+        missing_emission_columns,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+facility_raw <- facility_raw %>%
+  mutate(
+    facility_id = as.character(
+      facility_id
+    ),
+    
+    unit_id = as.character(
+      unit_id
+    ),
+    
+    year = safe_numeric(
+      year
+    )
+  )
+
+
+emission_raw <- emission_raw %>%
+  mutate(
+    facility_id = as.character(
+      facility_id
+    ),
+    
+    year = safe_numeric(
+      year
+    ),
+    
+    gross_load_mwh = safe_numeric(
+      gross_load_mwh
+    ),
+    
+    so2_mass_short_tons = safe_numeric(
+      so2_mass_short_tons
+    ),
+    
+    nox_mass_short_tons = safe_numeric(
+      nox_mass_short_tons
+    ),
+    
+    heat_input_mmbtu = safe_numeric(
+      heat_input_mmbtu
+    )
+  )
+
+
+# ======================================================================
+# 7. INSPECT RAW SO2 CONTROL VALUES
+# ======================================================================
+
+raw_control_counts <- facility_raw %>%
+  mutate(
+    so2_controls_display = ifelse(
+      is.na(so2_controls) |
+        str_trim(
+          as.character(
+            so2_controls
+          )
+        ) == "",
+      "[Missing / no reported control]",
+      as.character(
+        so2_controls
+      )
+    )
+  ) %>%
+  count(
+    so2_controls_display,
+    sort = TRUE
+  )
+
+write_table(
+  raw_control_counts,
+  "raw_so2_control_value_counts.csv"
+)
+
+cat("\nMost common SO2 control values:\n")
+print(
+  head(
+    raw_control_counts,
+    20
+  )
+)
+
+
+# ======================================================================
+# 8. STANDARDIZE UNIT-YEAR ATTRIBUTES
+# ======================================================================
+
+facility_unit_year <- facility_raw %>%
+  mutate(
+    
+    primary_fuel_text = str_to_lower(
+      ifelse(
+        is.na(primary_fuel_type),
+        "",
+        as.character(
+          primary_fuel_type
+        )
+      )
+    ),
+    
+    unit_is_coal = str_detect(
+      primary_fuel_text,
+      "coal"
+    ),
+    
+    so2_control_text = str_to_lower(
+      str_trim(
+        ifelse(
+          is.na(so2_controls),
+          "",
+          as.character(
+            so2_controls
+          )
+        )
+      )
+    ),
+    
+    unit_has_reported_so2_control = (
+      so2_control_text != ""
+    )
+  )
+
+
+# ======================================================================
+# 9. AGGREGATE UNIT-YEAR ATTRIBUTES TO FACILITY-YEAR
+# ======================================================================
+
+facility_year_attributes <- facility_unit_year %>%
+  group_by(
+    facility_id,
+    year
+  ) %>%
+  summarise(
+    
+    state_attribute = safe_first(
+      state
+    ),
+    
+    facility_name_attribute = safe_first(
+      facility_name
+    ),
+    
+    nerc_region = safe_first(
+      nerc_region
+    ),
+    
+    n_total_units = n_distinct(
+      unit_id
+    ),
+    
+    n_coal_units = n_distinct(
+      unit_id[
+        unit_is_coal
+      ]
+    ),
+    
+    n_units_with_reported_so2_control = n_distinct(
+      unit_id[
+        unit_has_reported_so2_control
+      ]
+    ),
+    
+    n_units_without_reported_so2_control = n_distinct(
+      unit_id[
+        !unit_has_reported_so2_control
+      ]
+    ),
+    
+    any_reported_so2_control = any(
+      unit_has_reported_so2_control,
+      na.rm = TRUE
+    ),
+    
+    all_units_reported_so2_control = all(
+      unit_has_reported_so2_control
+    ),
+    
+    share_units_with_reported_so2_control =
+      n_units_with_reported_so2_control /
+      n_total_units,
+    
+    primary_fuel_types = paste(
+      sort(
+        unique(
+          as.character(
+            primary_fuel_type[
+              !is.na(primary_fuel_type) &
+                as.character(primary_fuel_type) != ""
+            ]
+          )
+        )
+      ),
+      collapse = "; "
+    ),
+    
+    reported_so2_control_types = paste(
+      sort(
+        unique(
+          as.character(
+            so2_controls[
+              !is.na(so2_controls) &
+                str_trim(
+                  as.character(
+                    so2_controls
+                  )
+                ) != ""
+            ]
+          )
+        )
+      ),
+      collapse = "; "
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    
+    facility_control_group = case_when(
+      
+      n_units_with_reported_so2_control == 0 ~
+        "No reported control",
+      
+      n_units_with_reported_so2_control ==
+        n_total_units ~
+        "All units reported control",
+      
+      n_units_with_reported_so2_control > 0 &
+        n_units_with_reported_so2_control <
+        n_total_units ~
+        "Mixed control status",
+      
+      TRUE ~
+        "Unknown"
+    ),
+    
+    binary_control_group = ifelse(
+      any_reported_so2_control,
+      "At least one unit reported control",
+      "No unit reported control"
+    )
+  )
+
+
+facility_control_counts <- facility_year_attributes %>%
+  count(
+    facility_control_group,
+    sort = TRUE
+  )
+
+write_table(
+  facility_control_counts,
+  "facility_year_control_group_counts.csv"
+)
+
+cat("\nFacility-year control categories:\n")
+print(
+  facility_control_counts
+)
+
+
+# ======================================================================
+# 10. PREPARE FACILITY-YEAR EMISSIONS
+# ======================================================================
+
+emission_duplicate_check <- emission_raw %>%
+  count(
+    facility_id,
+    year
+  ) %>%
+  filter(
+    n > 1
+  )
+
+if (nrow(emission_duplicate_check) > 0) {
+  
+  readr::write_csv(
+    emission_duplicate_check,
+    file.path(
+      QA_DIR,
+      "duplicate_emission_facility_years.csv"
+    )
+  )
+  
+  stop(
+    paste0(
+      "The emissions file contains duplicate facility-year records. ",
+      "See duplicate_emission_facility_years.csv."
+    )
+  )
+}
+
+
+emission_facility_year <- emission_raw %>%
+  distinct(
+    facility_id,
+    year,
+    .keep_all = TRUE
+  )
+
+
+# ======================================================================
+# 11. CORRECT ONE-TO-ONE FACILITY-YEAR JOIN
+# ======================================================================
+
+campd <- emission_facility_year %>%
+  left_join(
+    facility_year_attributes,
+    by = c(
+      "facility_id",
+      "year"
+    )
+  )
+
+
+join_qa <- data.frame(
+  
+  statistic = c(
+    "Emission facility-year rows",
+    "Facility attribute facility-year rows",
+    "Merged facility-year rows",
+    "Unique merged facility-years",
+    "Rows missing facility attributes",
+    "Rows with duplicated facility-year after merge"
+  ),
+  
+  value = c(
+    nrow(
+      emission_facility_year
+    ),
+    
+    nrow(
+      facility_year_attributes
+    ),
+    
+    nrow(
+      campd
+    ),
+    
+    campd %>%
+      distinct(
+        facility_id,
+        year
+      ) %>%
+      nrow(),
+    
+    sum(
+      is.na(
+        campd$n_total_units
+      )
+    ),
+    
+    campd %>%
+      count(
+        facility_id,
+        year
+      ) %>%
+      filter(
+        n > 1
+      ) %>%
+      nrow()
+  )
+)
+
+readr::write_csv(
+  join_qa,
+  file.path(
+    QA_DIR,
+    "join_QA_summary.csv"
+  )
+)
+
+cat("\nJoin QA summary:\n")
+print(
+  join_qa
+)
+
+
+# ======================================================================
+# 12. DEFINE FUEL GROUP AND CALCULATE EMISSION FACTORS
+# ======================================================================
+
+campd <- campd %>%
+  mutate(
+    
+    fuel_text = str_to_lower(
+      ifelse(
+        is.na(primary_fuel_types),
+        "",
+        primary_fuel_types
+      )
+    ),
+    
+    fuel_group = case_when(
+      
+      str_detect(
+        fuel_text,
+        "coal"
+      ) ~
+        "Coal",
+      
+      str_detect(
+        fuel_text,
+        "natural gas|pipeline gas|gas"
+      ) ~
+        "Natural gas",
+      
+      str_detect(
+        fuel_text,
+        "oil|petroleum|diesel|distillate|residual"
+      ) ~
+        "Oil",
+      
+      TRUE ~
+        "Other"
+    ),
+    
+    so2_grams =
+      so2_mass_short_tons *
+      907184.74,
+    
+    nox_grams =
+      nox_mass_short_tons *
+      907184.74,
+    
+    so2_lb =
+      so2_mass_short_tons *
+      2000,
+    
+    nox_lb =
+      nox_mass_short_tons *
+      2000,
+    
+    generation_kwh =
+      gross_load_mwh *
+      1000,
+    
+    so2_g_kwh = ifelse(
+      is.finite(
+        generation_kwh
+      ) &
+        generation_kwh > 0,
+      so2_grams /
+        generation_kwh,
+      NA_real_
+    ),
+    
+    nox_g_kwh = ifelse(
+      is.finite(
+        generation_kwh
+      ) &
+        generation_kwh > 0,
+      nox_grams /
+        generation_kwh,
+      NA_real_
+    ),
+    
+    so2_lb_mwh = ifelse(
+      is.finite(
+        gross_load_mwh
+      ) &
+        gross_load_mwh > 0,
+      so2_lb /
+        gross_load_mwh,
+      NA_real_
+    ),
+    
+    nox_lb_mwh = ifelse(
+      is.finite(
+        gross_load_mwh
+      ) &
+        gross_load_mwh > 0,
+      nox_lb /
+        gross_load_mwh,
+      NA_real_
+    ),
+    
+    so2_lb_mmbtu = ifelse(
+      is.finite(
+        heat_input_mmbtu
+      ) &
+        heat_input_mmbtu > 0,
+      so2_lb /
+        heat_input_mmbtu,
+      NA_real_
+    ),
+    
+    nox_lb_mmbtu = ifelse(
+      is.finite(
+        heat_input_mmbtu
+      ) &
+        heat_input_mmbtu > 0,
+      nox_lb /
+        heat_input_mmbtu,
+      NA_real_
+    )
+  )
+
+
+# ======================================================================
+# 13. QUALITY CONTROL FILTERS
+# ======================================================================
+
+campd_flagged <- campd %>%
+  mutate(
+    
+    invalid_year = (
+      !is.finite(year) |
+        year < 1995 |
+        year > 2020
+    ),
+    
+    invalid_generation = (
+      !is.finite(
+        gross_load_mwh
+      ) |
+        gross_load_mwh <= 0
+    ),
+    
+    invalid_so2_mass = (
+      !is.finite(
+        so2_mass_short_tons
+      ) |
+        so2_mass_short_tons < 0
+    ),
+    
+    invalid_nox_mass = (
+      !is.na(
+        nox_mass_short_tons
+      ) &
+        (
+          !is.finite(
+            nox_mass_short_tons
+          ) |
+            nox_mass_short_tons < 0
+        )
+    ),
+    
+    extreme_so2_ef = (
+      is.finite(
+        so2_g_kwh
+      ) &
+        so2_g_kwh > 50
+    ),
+    
+    extreme_nox_ef = (
+      is.finite(
+        nox_g_kwh
+      ) &
+        nox_g_kwh > 20
+    )
+  )
+
+
+flagged_records <- campd_flagged %>%
+  filter(
+    invalid_year |
+      invalid_generation |
+      invalid_so2_mass |
+      invalid_nox_mass |
+      extreme_so2_ef |
+      extreme_nox_ef
+  )
+
+readr::write_csv(
+  flagged_records,
+  file.path(
+    QA_DIR,
+    "flagged_invalid_or_extreme_records.csv"
+  )
+)
+
+
+campd_clean <- campd_flagged %>%
+  filter(
+    !invalid_year,
+    !invalid_generation,
+    !invalid_so2_mass,
+    !invalid_nox_mass,
+    !extreme_so2_ef,
+    !extreme_nox_ef
+  )
+
+
+coal <- campd_clean %>%
+  filter(
+    fuel_group == "Coal"
+  ) %>%
+  mutate(
+    
+    period = case_when(
+      
+      year >= 1995 &
+        year <= 1999 ~
+        "1995-1999",
+      
+      year >= 2000 &
+        year <= 2004 ~
+        "2000-2004",
+      
+      year >= 2005 &
+        year <= 2009 ~
+        "2005-2009",
+      
+      year >= 2010 &
+        year <= 2014 ~
+        "2010-2014",
+      
+      year >= 2015 &
+        year <= 2020 ~
+        "2015-2020",
+      
+      TRUE ~
+        NA_character_
+    ),
+    
+    period = factor(
+      period,
+      levels = c(
+        "1995-1999",
+        "2000-2004",
+        "2005-2009",
+        "2010-2014",
+        "2015-2020"
+      )
+    )
+  )
+
+
+analysis_qa <- data.frame(
+  
+  statistic = c(
+    "Merged facility-year records",
+    "Clean facility-year records",
+    "Coal facility-year records",
+    "Unique coal facilities",
+    "Minimum coal year",
+    "Maximum coal year",
+    "Coal facility-years with no reported SO2 control",
+    "Coal facility-years with at least one reported SO2 control",
+    "Coal facility-years with mixed unit control status"
+  ),
+  
+  value = c(
+    nrow(
+      campd
+    ),
+    
+    nrow(
+      campd_clean
+    ),
+    
+    nrow(
+      coal
+    ),
+    
+    n_distinct(
+      coal$facility_id
+    ),
+    
+    min(
+      coal$year,
+      na.rm = TRUE
+    ),
+    
+    max(
+      coal$year,
+      na.rm = TRUE
+    ),
+    
+    sum(
+      coal$binary_control_group ==
+        "No unit reported control",
+      na.rm = TRUE
+    ),
+    
+    sum(
+      coal$binary_control_group ==
+        "At least one unit reported control",
+      na.rm = TRUE
+    ),
+    
+    sum(
+      coal$facility_control_group ==
+        "Mixed control status",
+      na.rm = TRUE
+    )
+  )
+)
+
+readr::write_csv(
+  analysis_qa,
+  file.path(
+    QA_DIR,
+    "analysis_QA_summary.csv"
+  )
+)
+
+
+# ======================================================================
+# 14. NATIONAL ANNUAL COAL EMISSION FACTORS
+# ======================================================================
+
+coal_annual <- coal %>%
+  group_by(
+    year
+  ) %>%
+  summarise(
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    total_heat_input_mmbtu = sum(
+      heat_input_mmbtu,
+      na.rm = TRUE
+    ),
+    
+    total_so2_tons = sum(
+      so2_mass_short_tons,
+      na.rm = TRUE
+    ),
+    
+    total_nox_tons = sum(
+      nox_mass_short_tons,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mwh =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        gross_load_mwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_lb_mwh =
+      sum(
+        nox_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        gross_load_mwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_lb_mmbtu =
+      sum(
+        nox_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    median_facility_so2_g_kwh =
+      median(
+        so2_g_kwh,
+        na.rm = TRUE
+      ),
+    
+    weighted_median_facility_so2_g_kwh =
+      weighted_median_safe(
+        so2_g_kwh,
+        gross_load_mwh
+      ),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    so2_to_nox_ef_ratio =
+      aggregate_so2_g_kwh /
+      aggregate_nox_g_kwh
+  )
+
+
+write_table(
+  coal_annual,
+  "coal_annual_emission_factors_corrected.csv"
+)
+
+
+# ======================================================================
+# 15. FIVE-YEAR PERIOD SUMMARY
+# ======================================================================
+
+coal_period <- coal %>%
+  filter(
+    !is.na(period)
+  ) %>%
+  group_by(
+    period
+  ) %>%
+  summarise(
+    
+    first_year = min(
+      year,
+      na.rm = TRUE
+    ),
+    
+    last_year = max(
+      year,
+      na.rm = TRUE
+    ),
+    
+    n_facility_years = n(),
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    total_heat_input_mmbtu = sum(
+      heat_input_mmbtu,
+      na.rm = TRUE
+    ),
+    
+    total_so2_tons = sum(
+      so2_mass_short_tons,
+      na.rm = TRUE
+    ),
+    
+    total_nox_tons = sum(
+      nox_mass_short_tons,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_lb_mmbtu =
+      sum(
+        nox_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    so2_to_nox_ef_ratio =
+      aggregate_so2_g_kwh /
+      aggregate_nox_g_kwh
+  )
+
+
+write_table(
+  coal_period,
+  "coal_period_emission_factors_corrected.csv"
+)
+
+
+# ======================================================================
+# 16. CONTROL STATUS: DETAILED THREE-GROUP COMPARISON
+# ======================================================================
+
+coal_control_detailed_annual <- coal %>%
+  filter(
+    facility_control_group %in%
+      c(
+        "No reported control",
+        "Mixed control status",
+        "All units reported control"
+      )
+  ) %>%
+  group_by(
+    year,
+    facility_control_group
+  ) %>%
+  summarise(
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    total_heat_input_mmbtu = sum(
+      heat_input_mmbtu,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+write_table(
+  coal_control_detailed_annual,
+  "coal_control_status_detailed_annual_corrected.csv"
+)
+
+
+coal_control_detailed_period <- coal %>%
+  filter(
+    !is.na(period),
+    facility_control_group %in%
+      c(
+        "No reported control",
+        "Mixed control status",
+        "All units reported control"
+      )
+  ) %>%
+  group_by(
+    period,
+    facility_control_group
+  ) %>%
+  summarise(
+    
+    n_facility_years = n(),
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+write_table(
+  coal_control_detailed_period,
+  "coal_control_status_detailed_by_period_corrected.csv"
+)
+
+
+# ======================================================================
+# 17. CONTROL STATUS: BINARY COMPARISON
+# ======================================================================
+
+coal_control_binary_annual <- coal %>%
+  filter(
+    binary_control_group %in%
+      c(
+        "No unit reported control",
+        "At least one unit reported control"
+      )
+  ) %>%
+  group_by(
+    year,
+    binary_control_group
+  ) %>%
+  summarise(
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    total_heat_input_mmbtu = sum(
+      heat_input_mmbtu,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+write_table(
+  coal_control_binary_annual,
+  "coal_control_binary_annual_corrected.csv"
+)
+
+
+coal_control_binary_period <- coal %>%
+  filter(
+    !is.na(period),
+    binary_control_group %in%
+      c(
+        "No unit reported control",
+        "At least one unit reported control"
+      )
+  ) %>%
+  group_by(
+    period,
+    binary_control_group
+  ) %>%
+  summarise(
+    
+    n_facility_years = n(),
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+write_table(
+  coal_control_binary_period,
+  "coal_control_binary_by_period_corrected.csv"
+)
+
+
+# ======================================================================
+# 18. CONTROL EFFECT DIAGNOSTIC TABLE
+# ======================================================================
+
+control_effect_diagnostic <- coal_control_binary_period %>%
+  select(
+    period,
+    binary_control_group,
+    aggregate_so2_g_kwh,
+    aggregate_so2_lb_mmbtu,
+    n_facilities,
+    total_generation_mwh
+  ) %>%
+  pivot_wider(
+    names_from = binary_control_group,
+    values_from = c(
+      aggregate_so2_g_kwh,
+      aggregate_so2_lb_mmbtu,
+      n_facilities,
+      total_generation_mwh
+    )
+  )
+
+
+g_control_column <- paste0(
+  "aggregate_so2_g_kwh_",
+  "At least one unit reported control"
+)
+
+g_no_control_column <- paste0(
+  "aggregate_so2_g_kwh_",
+  "No unit reported control"
+)
+
+hi_control_column <- paste0(
+  "aggregate_so2_lb_mmbtu_",
+  "At least one unit reported control"
+)
+
+hi_no_control_column <- paste0(
+  "aggregate_so2_lb_mmbtu_",
+  "No unit reported control"
+)
+
+
+if (
+  all(
+    c(
+      g_control_column,
+      g_no_control_column,
+      hi_control_column,
+      hi_no_control_column
+    ) %in%
+    names(
+      control_effect_diagnostic
+    )
+  )
+) {
+  
+  control_effect_diagnostic <-
+    control_effect_diagnostic %>%
+    mutate(
+      
+      controlled_to_uncontrolled_g_kwh_ratio =
+        .data[[g_control_column]] /
+        .data[[g_no_control_column]],
+      
+      percent_difference_controlled_g_kwh =
+        100 *
+        (
+          .data[[g_control_column]] /
+            .data[[g_no_control_column]] -
+            1
+        ),
+      
+      controlled_to_uncontrolled_lb_mmbtu_ratio =
+        .data[[hi_control_column]] /
+        .data[[hi_no_control_column]],
+      
+      percent_difference_controlled_lb_mmbtu =
+        100 *
+        (
+          .data[[hi_control_column]] /
+            .data[[hi_no_control_column]] -
+            1
+        )
+    )
+}
+
+
+write_table(
+  control_effect_diagnostic,
+  "control_effect_diagnostic_corrected.csv"
+)
+
+
+# ======================================================================
+# 19. EARLY VERSUS LATE PERIOD DIAGNOSTICS
+# ======================================================================
+
+early_coal <- coal %>%
+  filter(
+    year >= 1995,
+    year <= 1999
+  )
+
+late_coal <- coal %>%
+  filter(
+    year >= 2015,
+    year <= 2020
+  )
+
+
+early_so2_g_kwh <- safe_ratio(
+  sum(
+    early_coal$so2_grams,
+    na.rm = TRUE
+  ),
+  sum(
+    early_coal$generation_kwh,
+    na.rm = TRUE
+  )
+)
+
+late_so2_g_kwh <- safe_ratio(
+  sum(
+    late_coal$so2_grams,
+    na.rm = TRUE
+  ),
+  sum(
+    late_coal$generation_kwh,
+    na.rm = TRUE
+  )
+)
+
+early_nox_g_kwh <- safe_ratio(
+  sum(
+    early_coal$nox_grams,
+    na.rm = TRUE
+  ),
+  sum(
+    early_coal$generation_kwh,
+    na.rm = TRUE
+  )
+)
+
+late_nox_g_kwh <- safe_ratio(
+  sum(
+    late_coal$nox_grams,
+    na.rm = TRUE
+  ),
+  sum(
+    late_coal$generation_kwh,
+    na.rm = TRUE
+  )
+)
+
+early_so2_lb_mmbtu <- safe_ratio(
+  sum(
+    early_coal$so2_lb,
+    na.rm = TRUE
+  ),
+  sum(
+    early_coal$heat_input_mmbtu,
+    na.rm = TRUE
+  )
+)
+
+late_so2_lb_mmbtu <- safe_ratio(
+  sum(
+    late_coal$so2_lb,
+    na.rm = TRUE
+  ),
+  sum(
+    late_coal$heat_input_mmbtu,
+    na.rm = TRUE
+  )
+)
+
+
+diagnostic_ratios <- data.frame(
+  
+  metric = c(
+    "Coal SO2 EF, 1995-1999",
+    "Coal SO2 EF, 2015-2020",
+    "SO2 early-to-late ratio",
+    "SO2 percent decline",
+    "Coal NOx EF, 1995-1999",
+    "Coal NOx EF, 2015-2020",
+    "NOx early-to-late ratio",
+    "NOx percent decline",
+    "Coal SO2 heat-input rate, 1995-1999",
+    "Coal SO2 heat-input rate, 2015-2020",
+    "SO2 heat-input early-to-late ratio",
+    "SO2 heat-input percent decline",
+    "Early SO2-to-NOx EF ratio",
+    "Late SO2-to-NOx EF ratio"
+  ),
+  
+  value = c(
+    early_so2_g_kwh,
+    late_so2_g_kwh,
+    
+    safe_ratio(
+      early_so2_g_kwh,
+      late_so2_g_kwh
+    ),
+    
+    100 *
+      (
+        1 -
+          safe_ratio(
+            late_so2_g_kwh,
+            early_so2_g_kwh
+          )
+      ),
+    
+    early_nox_g_kwh,
+    late_nox_g_kwh,
+    
+    safe_ratio(
+      early_nox_g_kwh,
+      late_nox_g_kwh
+    ),
+    
+    100 *
+      (
+        1 -
+          safe_ratio(
+            late_nox_g_kwh,
+            early_nox_g_kwh
+          )
+      ),
+    
+    early_so2_lb_mmbtu,
+    late_so2_lb_mmbtu,
+    
+    safe_ratio(
+      early_so2_lb_mmbtu,
+      late_so2_lb_mmbtu
+    ),
+    
+    100 *
+      (
+        1 -
+          safe_ratio(
+            late_so2_lb_mmbtu,
+            early_so2_lb_mmbtu
+          )
+      ),
+    
+    safe_ratio(
+      early_so2_g_kwh,
+      early_nox_g_kwh
+    ),
+    
+    safe_ratio(
+      late_so2_g_kwh,
+      late_nox_g_kwh
+    )
+  ),
+  
+  unit = c(
+    "g/kWh",
+    "g/kWh",
+    "ratio",
+    "percent",
+    "g/kWh",
+    "g/kWh",
+    "ratio",
+    "percent",
+    "lb/MMBtu",
+    "lb/MMBtu",
+    "ratio",
+    "percent",
+    "ratio",
+    "ratio"
+  )
+)
+
+
+write_table(
+  diagnostic_ratios,
+  "key_diagnostic_ratios_corrected.csv"
+)
+
+cat("\nKey diagnostic ratios:\n")
+print(
+  diagnostic_ratios
+)
+
+
+# ======================================================================
+# 20. NERC REGIONAL ANALYSIS
+# ======================================================================
+
+coal_nerc_annual <- coal %>%
+  filter(
+    !is.na(
+      nerc_region
+    ),
+    nerc_region != ""
+  ) %>%
+  group_by(
+    year,
+    nerc_region
+  ) %>%
+  summarise(
+    
+    n_facilities = n_distinct(
+      facility_id
+    ),
+    
+    total_generation_mwh = sum(
+      gross_load_mwh,
+      na.rm = TRUE
+    ),
+    
+    aggregate_so2_g_kwh =
+      sum(
+        so2_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_nox_g_kwh =
+      sum(
+        nox_grams,
+        na.rm = TRUE
+      ) /
+      sum(
+        generation_kwh,
+        na.rm = TRUE
+      ),
+    
+    aggregate_so2_lb_mmbtu =
+      sum(
+        so2_lb,
+        na.rm = TRUE
+      ) /
+      sum(
+        heat_input_mmbtu,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+write_table(
+  coal_nerc_annual,
+  "coal_NERC_region_annual_emission_factors_corrected.csv"
+)
+
+
+# ======================================================================
+# 21. FIGURE: NATIONAL SO2 AND NOx EFs
+# ======================================================================
+
+coal_annual_long <- coal_annual %>%
+  select(
+    year,
+    aggregate_so2_g_kwh,
+    aggregate_nox_g_kwh
+  ) %>%
+  pivot_longer(
+    cols = c(
+      aggregate_so2_g_kwh,
+      aggregate_nox_g_kwh
+    ),
+    names_to = "pollutant",
+    values_to = "emission_factor"
+  ) %>%
+  mutate(
+    pollutant = recode(
+      pollutant,
+      aggregate_so2_g_kwh = "SO2",
+      aggregate_nox_g_kwh = "NOx"
+    )
+  )
+
+
+p_annual <- ggplot(
+  coal_annual_long,
+  aes(
+    x = year,
+    y = emission_factor,
+    linetype = pollutant,
+    shape = pollutant,
+    group = pollutant
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 2,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(
+      n = 7
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "Generation-normalized emission factor (g/kWh)",
+    linetype = NULL,
+    shape = NULL,
+    title = "Coal-fired SO2 and NOx emission factors reported by CAMPD"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  )
+
+
+save_plot(
+  p_annual,
+  "Figure_coal_annual_SO2_NOx_EF_corrected.png",
+  width = 8,
+  height = 5.5
+)
+
+
+# ======================================================================
+# 22. FIGURE: BINARY CONTROL COMPARISON
+# ======================================================================
+
+p_control_binary <- ggplot(
+  coal_control_binary_annual,
+  aes(
+    x = year,
+    y = aggregate_so2_g_kwh,
+    linetype = binary_control_group,
+    shape = binary_control_group,
+    group = binary_control_group
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 1.8,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(
+      n = 7
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "SO2 emission factor (g/kWh)",
+    linetype = NULL,
+    shape = NULL,
+    title = "Coal-fired SO2 emission factors by reported control status"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  )
+
+
+save_plot(
+  p_control_binary,
+  "Figure_coal_SO2_EF_by_control_status_corrected.png",
+  width = 9,
+  height = 5.5
+)
+
+
+# ======================================================================
+# 23. FIGURE: DETAILED CONTROL COMPARISON
+# ======================================================================
+
+p_control_detailed <- ggplot(
+  coal_control_detailed_annual,
+  aes(
+    x = year,
+    y = aggregate_so2_g_kwh,
+    linetype = facility_control_group,
+    shape = facility_control_group,
+    group = facility_control_group
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 1.7,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(
+      n = 7
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "SO2 emission factor (g/kWh)",
+    linetype = NULL,
+    shape = NULL,
+    title = "Coal-fired SO2 emission factors by facility control composition"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  )
+
+
+save_plot(
+  p_control_detailed,
+  "Figure_coal_SO2_EF_by_detailed_control_status_corrected.png",
+  width = 9,
+  height = 5.5
+)
+
+
+# ======================================================================
+# 24. FIGURE: HEAT-INPUT-NORMALIZED SO2 RATE
+# ======================================================================
+
+p_heat_input <- ggplot(
+  coal_annual,
+  aes(
+    x = year,
+    y = aggregate_so2_lb_mmbtu
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 2,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(
+      n = 7
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "SO2 emission rate (lb/MMBtu)",
+    title = "Heat-input-normalized coal SO2 emission rates"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  )
+
+
+save_plot(
+  p_heat_input,
+  "Figure_coal_SO2_lb_per_MMBtu_corrected.png",
+  width = 8,
+  height = 5.5
+)
+
+
+# ======================================================================
+# 25. FIGURE: SO2-TO-NOx EF RATIO
+# ======================================================================
+
+p_ratio <- ggplot(
+  coal_annual,
+  aes(
+    x = year,
+    y = so2_to_nox_ef_ratio
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 2,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(
+      n = 7
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "SO2-to-NOx emission-factor ratio",
+    title = "Temporal change in the coal SO2-to-NOx emission-factor ratio"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  )
+
+
+save_plot(
+  p_ratio,
+  "Figure_coal_SO2_to_NOx_EF_ratio_corrected.png",
+  width = 8,
+  height = 5.5
+)
+
+
+# ======================================================================
+# 26. AUTOMATIC INTERPRETATION SUMMARY
+# ======================================================================
+
+so2_decline <- diagnostic_ratios %>%
+  filter(
+    metric == "SO2 percent decline"
+  ) %>%
+  pull(
+    value
+  )
+
+nox_decline <- diagnostic_ratios %>%
+  filter(
+    metric == "NOx percent decline"
+  ) %>%
+  pull(
+    value
+  )
+
+so2_heat_decline <- diagnostic_ratios %>%
+  filter(
+    metric ==
+      "SO2 heat-input percent decline"
+  ) %>%
+  pull(
+    value
+  )
+
+
+interpretation_lines <- c(
+  
+  "CORRECTED CAMPD SO2 EMISSION-FACTOR DIAGNOSTIC",
+  "================================================",
+  "",
+  
+  paste0(
+    "Coal SO2 generation-normalized EF, 1995-1999: ",
+    round(
+      early_so2_g_kwh,
+      3
+    ),
+    " g/kWh."
+  ),
+  
+  paste0(
+    "Coal SO2 generation-normalized EF, 2015-2020: ",
+    round(
+      late_so2_g_kwh,
+      3
+    ),
+    " g/kWh."
+  ),
+  
+  paste0(
+    "Coal SO2 generation-normalized EF declined by ",
+    round(
+      so2_decline,
+      1
+    ),
+    "%."
+  ),
+  
+  paste0(
+    "Coal NOx generation-normalized EF declined by ",
+    round(
+      nox_decline,
+      1
+    ),
+    "%."
+  ),
+  
+  paste0(
+    "Coal SO2 heat-input-normalized emission rate declined by ",
+    round(
+      so2_heat_decline,
+      1
+    ),
+    "%."
+  ),
+  
+  "",
+  
+  "Interpretation:",
+  "",
+  
+  paste0(
+    "1. A strong decline in both generation-normalized and ",
+    "heat-input-normalized SO2 rates indicates that the temporal trend ",
+    "is not caused only by changes in plant efficiency."
+  ),
+  
+  paste0(
+    "2. If facilities with reported SO2 controls have lower emission ",
+    "rates than facilities with no reported controls, modern pollution ",
+    "controls likely contribute to the low CAMPD-derived SO2 factors."
+  ),
+  
+  paste0(
+    "3. If early CAMPD SO2 factors are substantially higher than late ",
+    "CAMPD factors, applying factors derived from the later modern fleet ",
+    "to historical generation can underestimate historical SO2 emissions."
+  ),
+  
+  paste0(
+    "4. The current CAMPD files identify coal only as a broad primary ",
+    "fuel category. They do not contain coal rank or measured sulfur ",
+    "content. Therefore, these results cannot directly demonstrate that ",
+    "increased use of low-sulfur coal caused the decline."
+  ),
+  
+  "",
+  
+  "Recommended wording:",
+  "",
+  
+  paste0(
+    "The lower reconstructed SO2 emissions are consistent with the use ",
+    "of emission factors derived from the modern, increasingly controlled ",
+    "coal fleet. The available CAMPD data do not allow the contribution ",
+    "of lower-sulfur coal to be quantified directly."
+  )
+)
+
+
+writeLines(
+  interpretation_lines,
+  file.path(
+    OUTPUT_DIR,
+    "automatic_interpretation_summary_corrected.txt"
+  )
+)
+
+
+# ======================================================================
+# 27. SAVE R OBJECTS
+# ======================================================================
+
+saveRDS(
+  facility_year_attributes,
+  file.path(
+    OUTPUT_DIR,
+    "facility_year_attributes_corrected.rds"
+  )
+)
+
+saveRDS(
+  campd_clean,
+  file.path(
+    OUTPUT_DIR,
+    "CAMPD_facility_year_analysis_corrected.rds"
+  )
+)
+
+saveRDS(
+  coal,
+  file.path(
+    OUTPUT_DIR,
+    "CAMPD_coal_facility_year_analysis_corrected.rds"
+  )
+)
+
+
+# ======================================================================
+# 28. FINAL MESSAGE
+# ======================================================================
+
+cat("\n============================================================\n")
+cat("Corrected analysis completed successfully.\n")
+cat("============================================================\n\n")
+
+cat("Please review these files first:\n\n")
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "coal_annual_emission_factors_corrected.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "coal_period_emission_factors_corrected.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "coal_control_binary_annual_corrected.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "coal_control_binary_by_period_corrected.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "control_effect_diagnostic_corrected.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    TABLE_DIR,
+    "key_diagnostic_ratios_corrected.csv"
+  ),
+  "\n\n"
+)
+
+cat("Main figures:\n\n")
+
+cat(
+  file.path(
+    FIGURE_DIR,
+    "Figure_coal_annual_SO2_NOx_EF_corrected.png"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    FIGURE_DIR,
+    "Figure_coal_SO2_EF_by_control_status_corrected.png"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    FIGURE_DIR,
+    "Figure_coal_SO2_EF_by_detailed_control_status_corrected.png"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    FIGURE_DIR,
+    "Figure_coal_SO2_lb_per_MMBtu_corrected.png"
+  ),
+  "\n\n"
+)
+
+cat("Interpretation summary:\n")
+
+cat(
+  file.path(
+    OUTPUT_DIR,
+    "automatic_interpretation_summary_corrected.txt"
+  ),
+  "\n"
+)
+
+# ======================================================================
+# FIGURE S5
+# Temporal trends in coal-fired SO2 emission factors reported by CAMPD
+# ======================================================================
+
+rm(list = ls())
+
+options(
+  stringsAsFactors = FALSE,
+  scipen = 999
+)
+
+
+# ======================================================================
+# 1. PACKAGES
+# ======================================================================
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "ggplot2",
+  "readr",
+  "scales",
+  "patchwork"
+)
+
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+invisible(
+  lapply(
+    required_packages,
+    library,
+    character.only = TRUE
+  )
+)
+
+
+# ======================================================================
+# 2. PATHS
+# ======================================================================
+
+PROJECT_DIR <- file.path(
+  "/Users/xshan2",
+  "OneDrive - George Mason University - O365 Production",
+  "GMU_PhD",
+  "01_Research",
+  "02_2019fall_ADRD",
+  "prelim_analysis",
+  "PowerPlant",
+  "EF_pp_paper_code"
+)
+
+DIAGNOSTIC_DIR <- file.path(
+  PROJECT_DIR,
+  "output",
+  "CAMPD_SO2_EF_diagnostic_corrected"
+)
+
+TABLE_DIR <- file.path(
+  DIAGNOSTIC_DIR,
+  "tables"
+)
+
+FIGURE_DIR <- file.path(
+  DIAGNOSTIC_DIR,
+  "figures"
+)
+
+dir.create(
+  FIGURE_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+ANNUAL_EF_FILE <- file.path(
+  TABLE_DIR,
+  "coal_annual_emission_factors_corrected.csv"
+)
+
+CONTROL_FILE <- file.path(
+  TABLE_DIR,
+  "coal_control_binary_annual_corrected.csv"
+)
+
+
+if (!file.exists(ANNUAL_EF_FILE)) {
+  stop(
+    paste0(
+      "File not found:\n",
+      ANNUAL_EF_FILE
+    )
+  )
+}
+
+if (!file.exists(CONTROL_FILE)) {
+  stop(
+    paste0(
+      "File not found:\n",
+      CONTROL_FILE
+    )
+  )
+}
+
+
+# ======================================================================
+# 3. READ DATA
+# ======================================================================
+
+annual_ef <- readr::read_csv(
+  ANNUAL_EF_FILE,
+  show_col_types = FALSE
+)
+
+control_annual <- readr::read_csv(
+  CONTROL_FILE,
+  show_col_types = FALSE
+)
+
+
+cat("\nAnnual EF columns:\n")
+print(names(annual_ef))
+
+cat("\nControl-status columns:\n")
+print(names(control_annual))
+
+
+# ======================================================================
+# 4. DATA PREPARATION
+# ======================================================================
+
+annual_ef <- annual_ef %>%
+  mutate(
+    year = as.numeric(year),
+    aggregate_so2_g_kwh = as.numeric(
+      aggregate_so2_g_kwh
+    ),
+    aggregate_so2_lb_mmbtu = as.numeric(
+      aggregate_so2_lb_mmbtu
+    )
+  ) %>%
+  filter(
+    is.finite(year),
+    year >= 1997,
+    year <= 2020
+  )
+
+
+control_annual <- control_annual %>%
+  mutate(
+    year = as.numeric(year),
+    aggregate_so2_g_kwh = as.numeric(
+      aggregate_so2_g_kwh
+    ),
+    
+    binary_control_group = case_when(
+      
+      binary_control_group ==
+        "At least one unit reported control" ~
+        "At least one unit reported control",
+      
+      binary_control_group ==
+        "No unit reported control" ~
+        "No unit reported control",
+      
+      TRUE ~
+        binary_control_group
+    ),
+    
+    binary_control_group = factor(
+      binary_control_group,
+      levels = c(
+        "No unit reported control",
+        "At least one unit reported control"
+      )
+    )
+  ) %>%
+  filter(
+    is.finite(year),
+    year >= 1997,
+    year <= 2020,
+    !is.na(binary_control_group)
+  )
+
+
+# ======================================================================
+# 5. COMMON THEME
+# ======================================================================
+
+theme_figure_S5 <- theme_bw(
+  base_size = 11
+) +
+  theme(
+    panel.grid.minor = element_blank(),
+    
+    panel.grid.major = element_line(
+      linewidth = 0.25
+    ),
+    
+    axis.title = element_text(
+      size = 11
+    ),
+    
+    axis.text = element_text(
+      size = 10
+    ),
+    
+    plot.title = element_text(
+      size = 11,
+      face = "plain",
+      hjust = 0
+    ),
+    
+    legend.title = element_blank(),
+    
+    legend.text = element_text(
+      size = 9.5
+    ),
+    
+    legend.position = "bottom",
+    
+    plot.margin = margin(
+      t = 7,
+      r = 7,
+      b = 7,
+      l = 7
+    )
+  )
+
+
+year_scale <- scale_x_continuous(
+  breaks = c(
+    1997,
+    2000,
+    2005,
+    2010,
+    2015,
+    2020
+  ),
+  limits = c(
+    1997,
+    2020
+  ),
+  expand = expansion(
+    mult = c(
+      0.01,
+      0.02
+    )
+  )
+)
+
+
+# ======================================================================
+# 6. PANEL A
+# Generation-normalized SO2 emission factor
+# ======================================================================
+
+panel_a <- ggplot(
+  annual_ef,
+  aes(
+    x = year,
+    y = aggregate_so2_g_kwh
+  )
+) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  geom_point(
+    size = 1.8
+  ) +
+  year_scale +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(
+      n = 6
+    ),
+    expand = expansion(
+      mult = c(
+        0,
+        0.06
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = expression(
+      "SO"[2] *
+        " emission factor (g kWh"^{-1} * ")"
+    ),
+    title = "(a)"
+  ) +
+  theme_figure_S5 +
+  theme(
+    legend.position = "none"
+  )
+
+
+# ======================================================================
+# 7. PANEL B
+# Heat-input-normalized SO2 emission rate
+# ======================================================================
+
+panel_b <- ggplot(
+  annual_ef,
+  aes(
+    x = year,
+    y = aggregate_so2_lb_mmbtu
+  )
+) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  geom_point(
+    size = 1.8
+  ) +
+  year_scale +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(
+      n = 6
+    ),
+    expand = expansion(
+      mult = c(
+        0,
+        0.06
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = expression(
+      "SO"[2] *
+        " emission rate (lb MMBtu"^{-1} * ")"
+    ),
+    title = "(b)"
+  ) +
+  theme_figure_S5 +
+  theme(
+    legend.position = "none"
+  )
+
+
+# ======================================================================
+# 8. PANEL C
+# SO2 emission factor by reported control status
+# ======================================================================
+
+panel_c <- ggplot(
+  control_annual,
+  aes(
+    x = year,
+    y = aggregate_so2_g_kwh,
+    linetype = binary_control_group,
+    shape = binary_control_group,
+    group = binary_control_group
+  )
+) +
+  geom_line(
+    linewidth = 0.8,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 1.8,
+    na.rm = TRUE
+  ) +
+  year_scale +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(
+      n = 6
+    ),
+    expand = expansion(
+      mult = c(
+        0,
+        0.06
+      )
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "No unit reported control" = "solid",
+      "At least one unit reported control" = "dashed"
+    )
+  ) +
+  scale_shape_manual(
+    values = c(
+      "No unit reported control" = 16,
+      "At least one unit reported control" = 17
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = expression(
+      "SO"[2] *
+        " emission factor (g kWh"^{-1} * ")"
+    ),
+    linetype = NULL,
+    shape = NULL,
+    title = "(c)"
+  ) +
+  theme_figure_S5 +
+  guides(
+    linetype = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    ),
+    shape = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    )
+  )
+
+
+# ======================================================================
+# 9. COMBINE PANELS
+# ======================================================================
+
+figure_S5 <- (
+  panel_a |
+    panel_b
+) /
+  panel_c +
+  plot_layout(
+    heights = c(
+      1,
+      1.08
+    ),
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "bottom"
+  )
+
+
+# ======================================================================
+# 10. SAVE FIGURE
+# ======================================================================
+
+PNG_FILE <- file.path(
+  FIGURE_DIR,
+  "Figure_S5_CAMPD_coal_SO2_emission_factors.png"
+)
+
+PDF_FILE <- file.path(
+  FIGURE_DIR,
+  "Figure_S5_CAMPD_coal_SO2_emission_factors.pdf"
+)
+
+
+ggsave(
+  filename = PNG_FILE,
+  plot = figure_S5,
+  width = 8.5,
+  height = 8.0,
+  dpi = 600,
+  bg = "white",
+  device = "png"
+)
+
+ggsave(
+  filename = PDF_FILE,
+  plot = figure_S5,
+  width = 8.5,
+  height = 8.0,
+  bg = "white",
+  device = "pdf"
+)
+
+
+cat("\nFigure S5 saved successfully:\n\n")
+cat(PNG_FILE, "\n")
+cat(PDF_FILE, "\n")
+
