@@ -1,0 +1,537 @@
+#!/usr/bin/env Rscript
+
+# ================================================================
+# VERSION 2 (eGRID ORISPL-to-subregion crosswalk)
+# Figure S2. Coal-fired SO2 emission rates by selected eGRID regions
+# CAMPD, 1996-2020
+# ================================================================
+
+rm(list = ls(all.names = TRUE))
+graphics.off()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readxl)
+  library(readr)
+  library(stringr)
+  library(tidyr)
+  library(janitor)
+  library(ggplot2)
+  library(scales)
+})
+
+# ----------------------------------------------------------------
+# 1. Paths
+# ----------------------------------------------------------------
+
+project_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  ),
+  paste0(
+    "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/03_powerplant"
+  )
+)
+
+legacy_data_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production/",
+    "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+    "EF_pp_paper_code/data"
+  ),
+  paste0(
+    "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
+    "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+    "EF_pp_paper_code/data"
+  )
+)
+
+project_root <- project_roots[dir.exists(project_roots)][1]
+if (is.na(project_root)) stop("Cannot locate the 03_powerplant project folder.")
+
+search_roots <- unique(c(
+  file.path(project_root, "data"),
+  legacy_data_roots[dir.exists(legacy_data_roots)]
+))
+
+output_dir <- file.path(project_root, "Figure_plot")
+processed_dir <- file.path(project_root, "data", "processed_modern_emissions")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
+
+find_files <- function(pattern) {
+  unique(unlist(lapply(
+    search_roots,
+    list.files,
+    pattern = pattern,
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )))
+}
+
+choose_file <- function(files, description) {
+  if (length(files) == 0) stop("Cannot find ", description, ".")
+  files[order(nchar(files))][1]
+}
+
+attribute_file <- choose_file(
+  find_files("facility-attributes-1995-2020-CAMPD\\.csv$"),
+  "facility-attributes-1995-2020-CAMPD.csv"
+)
+
+# Locate both versions. The historical Figure S2 was based on the
+# facility-aggregation series; use it by default because Unit.ID formatting
+# differs between some CAMPD downloads and can cause most unit joins to fail.
+unit_emission_candidates <- find_files(
+  "annual-emissions-unit-1996-2020-CAMPD\\.csv$"
+)
+
+facility_emission_candidates <- find_files(
+  "annual-emissions-facility-aggregation-1995-2020-CAMPD\\.csv$"
+)
+
+use_unit_data <- FALSE
+emission_file <- if (length(facility_emission_candidates) > 0) {
+  choose_file(facility_emission_candidates, "facility-level CAMPD emissions")
+} else {
+  use_unit_data <- TRUE
+  choose_file(unit_emission_candidates, "unit-level CAMPD emissions")
+}
+
+message("Attributes: ", attribute_file)
+message("Emissions:  ", emission_file)
+message("Analysis level: ", ifelse(use_unit_data, "unit", "facility fallback"))
+
+# ----------------------------------------------------------------
+# 2. Helpers
+# ----------------------------------------------------------------
+
+num <- function(x) {
+  x <- gsub(",", "", trimws(as.character(x)), fixed = TRUE)
+  x[x %in% c("", "NA", "N/A", "--", ".")] <- NA_character_
+  suppressWarnings(as.numeric(x))
+}
+
+normalize_id <- function(x) trimws(as.character(x))
+
+is_coal_fuel <- function(x) {
+  str_detect(
+    tolower(trimws(as.character(x))),
+    "coal|bituminous|subbituminous|lignite|anthracite"
+  )
+}
+
+first_nonmissing <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & trimws(x) != ""]
+  if (length(x) == 0) NA_character_ else x[1]
+}
+
+selected_regions <- c(
+  "ERCT", "FRCC", "MROW", "RFCE",
+  "RFCW", "SRSO", "SRTV", "SRVC"
+)
+
+# ----------------------------------------------------------------
+# 3. Build ORISPL -> eGRID subregion crosswalk from historical eGRID
+# ----------------------------------------------------------------
+
+egrid_dirs <- unlist(lapply(
+  search_roots,
+  list.dirs,
+  recursive = TRUE,
+  full.names = TRUE
+))
+egrid_dirs <- unique(egrid_dirs[
+  str_detect(egrid_dirs, regex("egrid.*historical", ignore_case = TRUE))
+])
+if (length(egrid_dirs) == 0) {
+  stop("Cannot locate the historical eGRID workbook directory.")
+}
+egrid_dir <- egrid_dirs[1]
+
+egrid_files <- list.files(
+  egrid_dir,
+  pattern = "\\.(xls|xlsx)$",
+  recursive = TRUE,
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+egrid_files <- egrid_files[
+  str_detect(basename(egrid_files), regex("egrid.*(plant|data)", ignore_case = TRUE))
+]
+
+first_match <- function(x, patterns) {
+  for (p in patterns) {
+    hit <- x[str_detect(x, regex(p, ignore_case = TRUE))]
+    if (length(hit) > 0) return(hit[1])
+  }
+  NA_character_
+}
+
+read_egrid_crosswalk <- function(path) {
+  file_year <- suppressWarnings(as.integer(str_extract(basename(path), "(19|20)\\d{2}")))
+  sheets <- tryCatch(excel_sheets(path), error = function(e) character())
+  if (length(sheets) == 0) return(tibble())
+
+  plant_sheets <- sheets[str_detect(sheets, regex("PLNT|PLANT", ignore_case = TRUE))]
+  sheet <- if (length(plant_sheets) > 0) plant_sheets[1] else sheets[1]
+
+  for (skip_n in c(1, 3, 4, 5, 0, 2, 6, 7)) {
+    x <- tryCatch(
+      suppressMessages(
+        read_excel(path, sheet = sheet, skip = skip_n, col_types = "text")
+      ) %>% clean_names(),
+      error = function(e) NULL
+    )
+    if (is.null(x)) next
+
+    nms <- names(x)
+    id_col <- first_match(
+      nms,
+      c(
+        "^orispl$", "oris.*plant", "oris.*code",
+        "plant.*facility.*code", "plant.*code", "^plant_id$"
+      )
+    )
+    subregion_col <- first_match(
+      nms,
+      c(
+        "egrid.*subregion.*acronym", "subregion.*acronym",
+        "egrid.*subregion", "^subregion$", "^srname$"
+      )
+    )
+
+    if (!is.na(id_col) && !is.na(subregion_col)) {
+      message(
+        "Crosswalk: ", basename(path),
+        " | sheet=", sheet, " | skip=", skip_n,
+        " | ID=", id_col, " | subregion=", subregion_col
+      )
+      return(
+        x %>%
+          transmute(
+            facility_id = normalize_id(.data[[id_col]]),
+            egrid_year = file_year,
+            region = toupper(trimws(as.character(.data[[subregion_col]])))
+          ) %>%
+          filter(
+            !is.na(facility_id), facility_id != "",
+            region %in% selected_regions
+          ) %>%
+          distinct()
+      )
+    }
+  }
+
+  warning("No ORISPL/subregion columns found in: ", basename(path))
+  tibble()
+}
+
+egrid_crosswalk_history <- bind_rows(lapply(egrid_files, read_egrid_crosswalk))
+if (nrow(egrid_crosswalk_history) == 0) {
+  stop("No eGRID plant-subregion crosswalk records were extracted.")
+}
+
+# A plant can occur in several annual workbooks. Select its most frequently
+# reported subregion; break ties using the most recent workbook year.
+plant_subregion_crosswalk <- egrid_crosswalk_history %>%
+  filter(region %in% selected_regions) %>%
+  group_by(facility_id, region) %>%
+  summarise(
+    n_years_reported = n_distinct(egrid_year),
+    most_recent_year = max(egrid_year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(facility_id, desc(n_years_reported), desc(most_recent_year)) %>%
+  group_by(facility_id) %>%
+  slice(1) %>%
+  ungroup()
+
+write_csv(
+  plant_subregion_crosswalk,
+  file.path(processed_dir, "CAMPD_facility_to_eGRID_subregion_crosswalk.csv")
+)
+
+message("eGRID crosswalk plants: ", nrow(plant_subregion_crosswalk))
+
+# ----------------------------------------------------------------
+# 4. Read and standardize facility/unit attributes
+# ----------------------------------------------------------------
+
+attributes_raw <- read_csv(
+  attribute_file,
+  show_col_types = FALSE,
+  guess_max = 300000
+) %>%
+  clean_names()
+
+required_attribute_columns <- c(
+  "facility_id", "unit_id", "year", "nerc_region", "primary_fuel_type"
+)
+
+missing_attributes <- setdiff(required_attribute_columns, names(attributes_raw))
+if (length(missing_attributes) > 0) {
+  stop("Missing attribute columns: ", paste(missing_attributes, collapse = ", "))
+}
+
+attributes <- attributes_raw %>%
+  transmute(
+    facility_id = normalize_id(facility_id),
+    unit_id = normalize_id(unit_id),
+    year = as.integer(year),
+    primary_fuel = as.character(primary_fuel_type),
+    coal_unit = is_coal_fuel(primary_fuel_type)
+  ) %>%
+  filter(
+    year >= 1996,
+    year <= 2020
+  )
+
+# One record per unit-year prevents accidental multiplication in the join.
+attributes_unit <- attributes %>%
+  group_by(facility_id, unit_id, year) %>%
+  summarise(
+    coal_unit = any(coal_unit, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+duplicate_check <- attributes_unit %>%
+  count(facility_id, unit_id, year) %>%
+  filter(n > 1)
+
+if (nrow(duplicate_check) > 0) {
+  stop("Duplicate unit-year attribute records remain after aggregation.")
+}
+
+# ----------------------------------------------------------------
+# 5. Read emissions and join without duplicating observations
+# ----------------------------------------------------------------
+
+emissions_raw <- read_csv(
+  emission_file,
+  show_col_types = FALSE,
+  guess_max = 500000
+) %>%
+  clean_names()
+
+required_emission_columns <- c(
+  "facility_id", "year", "so2_mass_short_tons", "heat_input_mm_btu"
+)
+
+missing_emissions <- setdiff(required_emission_columns, names(emissions_raw))
+if (length(missing_emissions) > 0) {
+  stop("Missing emissions columns: ", paste(missing_emissions, collapse = ", "))
+}
+
+if (use_unit_data) {
+  if (!"unit_id" %in% names(emissions_raw)) {
+    stop("The selected unit-level emissions file has no Unit.ID column.")
+  }
+
+  emissions <- emissions_raw %>%
+    transmute(
+      facility_id = normalize_id(facility_id),
+      unit_id = normalize_id(unit_id),
+      year = as.integer(year),
+      so2_short_tons = num(so2_mass_short_tons),
+      heat_input_mmbtu = num(heat_input_mm_btu)
+    ) %>%
+    filter(year >= 1996, year <= 2020) %>%
+    group_by(facility_id, unit_id, year) %>%
+    summarise(
+      so2_short_tons = sum(so2_short_tons, na.rm = TRUE),
+      heat_input_mmbtu = sum(heat_input_mmbtu, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  analysis_data <- emissions %>%
+    inner_join(
+      attributes_unit,
+      by = c("facility_id", "unit_id", "year")
+    ) %>%
+    filter(coal_unit)
+
+} else {
+  # Fallback: classify a facility-year as coal when it contains at least
+  # one coal unit. This is less precise than unit-level emissions.
+  attributes_facility <- attributes %>%
+    group_by(facility_id, year) %>%
+    summarise(
+      coal_facility = any(coal_unit, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  emissions <- emissions_raw %>%
+    transmute(
+      facility_id = normalize_id(facility_id),
+      year = as.integer(year),
+      so2_short_tons = num(so2_mass_short_tons),
+      heat_input_mmbtu = num(heat_input_mm_btu)
+    ) %>%
+    filter(year >= 1996, year <= 2020) %>%
+    group_by(facility_id, year) %>%
+    summarise(
+      so2_short_tons = sum(so2_short_tons, na.rm = TRUE),
+      heat_input_mmbtu = sum(heat_input_mmbtu, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  analysis_data <- emissions %>%
+    inner_join(
+      attributes_facility,
+      by = c("facility_id", "year")
+    ) %>%
+    filter(coal_facility)
+}
+
+# Attach the correct eGRID subregion using ORISPL/Facility.ID.
+analysis_data <- analysis_data %>%
+  inner_join(
+    plant_subregion_crosswalk %>% select(facility_id, region),
+    by = "facility_id"
+  )
+
+message(
+  "Matched analysis rows by eGRID subregion:\n",
+  paste(capture.output(print(count(analysis_data, region), n = Inf)), collapse = "\n")
+)
+
+# ----------------------------------------------------------------
+# 6. Regional heat-input-weighted SO2 emission rates
+# ----------------------------------------------------------------
+
+regional_rates <- analysis_data %>%
+  filter(
+    region %in% selected_regions,
+    is.finite(so2_short_tons),
+    is.finite(heat_input_mmbtu),
+    heat_input_mmbtu > 0,
+    so2_short_tons >= 0
+  ) %>%
+  group_by(region, year) %>%
+  summarise(
+    so2_short_tons = sum(so2_short_tons, na.rm = TRUE),
+    heat_input_mmbtu = sum(heat_input_mmbtu, na.rm = TRUE),
+    n_records = n(),
+    so2_rate_lb_mmbtu = so2_short_tons * 2000 / heat_input_mmbtu,
+    .groups = "drop"
+  ) %>%
+  mutate(region = factor(region, levels = selected_regions)) %>%
+  arrange(region, year)
+
+if (nrow(regional_rates) == 0) {
+  stop("No regional coal SO2 emission-rate observations were produced.")
+}
+
+write_csv(
+  regional_rates,
+  file.path(processed_dir, "Figure_S2_regional_coal_SO2_rates.csv")
+)
+
+print(regional_rates, n = Inf)
+
+# ----------------------------------------------------------------
+# 6. Publication figure
+# ----------------------------------------------------------------
+
+fig_s2 <- ggplot(
+  regional_rates,
+  aes(x = year, y = so2_rate_lb_mmbtu, group = region)
+) +
+  geom_line(
+    color = "#1F4E79",
+    linewidth = 0.85,
+    lineend = "round"
+  ) +
+  geom_point(
+    color = "#1F4E79",
+    size = 1.25,
+    shape = 16
+  ) +
+  facet_wrap(
+    ~ region,
+    ncol = 3,
+    scales = "free_y",
+    drop = FALSE
+  ) +
+  scale_x_continuous(
+    breaks = c(1996, 2000, 2005, 2010, 2015, 2020),
+    limits = c(1995.5, 2020.5),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 0.1),
+    expand = expansion(mult = c(0.03, 0.08))
+  ) +
+  labs(
+    x = "Year",
+    y = expression(SO[2]~"emission rate (lb MMBtu"^{-1}*")")
+  ) +
+  theme_classic(base_size = 11, base_family = "sans") +
+  theme(
+    text = element_text(color = "black"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9, color = "black"),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.ticks = element_line(linewidth = 0.35, color = "black"),
+    axis.ticks.length = grid::unit(0.12, "cm"),
+    panel.border = element_rect(
+      color = "black", fill = NA, linewidth = 0.45
+    ),
+    panel.grid.major.y = element_line(
+      color = "grey88", linewidth = 0.3
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(
+      fill = "grey94", color = "black", linewidth = 0.45
+    ),
+    strip.text = element_text(
+      size = 10, face = "bold", margin = margin(3, 3, 3, 3)
+    ),
+    panel.spacing.x = grid::unit(0.65, "lines"),
+    panel.spacing.y = grid::unit(0.70, "lines"),
+    plot.margin = margin(7, 8, 7, 7)
+  )
+
+print(fig_s2)
+
+# ----------------------------------------------------------------
+# 7. Save PDF, PNG, and TIFF
+# ----------------------------------------------------------------
+
+pdf_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.pdf")
+png_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.png")
+tiff_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.tiff")
+
+ggsave(
+  pdf_file, fig_s2,
+  width = 7.4, height = 6.1, units = "in",
+  device = cairo_pdf, bg = "white"
+)
+
+ggsave(
+  png_file, fig_s2,
+  width = 7.4, height = 6.1, units = "in",
+  dpi = 600, type = "cairo", bg = "white"
+)
+
+ggsave(
+  tiff_file, fig_s2,
+  width = 7.4, height = 6.1, units = "in",
+  dpi = 600, compression = "lzw", bg = "white"
+)
+
+message("Figure S2 PDF:  ", pdf_file)
+message("Figure S2 PNG:  ", png_file)
+message("Figure S2 TIFF: ", tiff_file)
+message("Figure S2 data: ", file.path(
+  processed_dir, "Figure_S2_regional_coal_SO2_rates.csv"
+))
+
