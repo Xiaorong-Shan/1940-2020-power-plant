@@ -473,8 +473,9 @@ panel_a <- ggplot(
       accuracy = 0.1,
       trim = TRUE
     ),
+    limits = c(0, NA),
     expand = expansion(
-      mult = c(0.03, 0.08)
+      mult = c(0, 0.08)
     )
   ) +
   labs(
@@ -543,8 +544,9 @@ panel_b <- ggplot(
       accuracy = 0.1,
       trim = TRUE
     ),
+    limits = c(0, NA),
     expand = expansion(
-      mult = c(0.03, 0.08)
+      mult = c(0, 0.08)
     )
   ) +
   labs(
