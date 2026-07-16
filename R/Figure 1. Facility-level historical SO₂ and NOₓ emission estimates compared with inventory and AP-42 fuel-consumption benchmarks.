@@ -5,7 +5,6 @@
 # (a) National totals compared across three estimation approaches
 # (b) Fuel-specific comparison of facility reconstruction and AP-42
 # ================================================================
-
 suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
@@ -159,7 +158,225 @@ theme_publication <- function(base_size = 10) {
 }
 
 # ================================================================
-# 3. Panel (a): national totals
+# 3. AP-42 baseline benchmark
+# ================================================================
+
+# The paper describes one AP-42 benchmark, not a sensitivity scenario.
+# Calculate both the national totals and fuel-specific estimates from
+# the same baseline activity-by-emission-factor calculation. No AP-42
+# result used in the figure is entered manually.
+
+# Unit helpers
+Btu_to_J <- 1055.05585262
+TBtu_to_GJ <- (1e12 * Btu_to_J) / 1e9
+short_ton_to_metric_t <- 0.90718474
+GJ_per_bbl_resid <- 6.287
+GJ_per_scf_gas <- 0.001055
+kg_per_kst <- 907184.74
+GJ_per_MMBtu <- 1.05505585262
+lb_to_kg <- 0.45359237
+
+ef_lbMMBtu_to_kgGJ <- function(lb_per_MMBtu) {
+  (lb_per_MMBtu * lb_to_kg) / GJ_per_MMBtu
+}
+
+ef_so2_from_sulfur <- function(
+    sulfur_mass_fraction,
+    HHV_GJ_per_metric_t
+) {
+  (2000 * sulfur_mass_fraction) / HHV_GJ_per_metric_t
+}
+
+# Baseline assumptions used in the original AP-42 calculation.
+# If these assumptions are changed, panel (a) and panel (b) update together.
+HHV_coal_GJt <- c(
+  `1940` = 26,
+  `1950` = 26,
+  `1960` = 26,
+  `1970` = 25,
+  `1980` = 24,
+  `1990` = 24
+)
+
+SO2_sulfur_fraction <- c(
+  Coal = 0.020,
+  Oil = 0.020,
+  Gas = 0.0002
+)
+
+NOx_lb_per_MMBtu <- c(
+  Coal = 0.50,
+  Oil = 0.35,
+  Gas = 0.15
+)
+
+# 1940–1949: Historical Statistics of the United States,
+# Series S 95–107 (physical fuel units converted to GJ).
+us_1940s_phys <- tibble(
+  year = 1940:1949,
+  coal_kst = c(
+    51474, 62668, 66257, 77301, 80084,
+    74725, 72871, 89581, 99586, 83968
+  ),
+  oil_kbbl = c(
+    16825, 20077, 15236, 17986, 20862,
+    20228, 36816, 45309, 42645, 66801
+  ),
+  gas_million_scf = c(
+    180096, 201768, 285208, 301987, 358784,
+    326212, 806942, 878054, 478097, 550121
+  )
+)
+
+activity_1940s <- us_1940s_phys %>%
+  transmute(
+    year,
+    Coal =
+      coal_kst * 1000 * short_ton_to_metric_t * 26,
+    Oil =
+      oil_kbbl * 1000 * GJ_per_bbl_resid,
+    Gas =
+      gas_million_scf * 1e6 * GJ_per_scf_gas
+  )
+
+# 1950–1990: EIA Annual Energy Review 2011, Table 8.4a.
+# Activity is reported in trillion Btu and converted to GJ.
+aer_1950_1990_TBtu <- tribble(
+  ~year, ~Coal, ~Oil, ~Gas,
+  1950,  2199,  472,  651,
+  1955,  3458,  471, 1194,
+  1960,  4228,  553, 1785,
+  1965,  5821,  722, 2395,
+  1970,  7227, 2117, 4054,
+  1975,  8786, 3166, 3240,
+  1976,  9720, 3477, 3152,
+  1977, 10262, 3901, 3284,
+  1978, 10238, 3987, 3297,
+  1979, 11260, 3283, 3613,
+  1980, 12123, 2634, 3810,
+  1985, 14542, 1090, 3160,
+  1986, 14444, 1452, 2691,
+  1987, 15173, 1257, 2935,
+  1988, 15850, 1563, 2709,
+  1989, 16359, 1175, 3582,
+  1990, 16477, 1366, 3791
+)
+
+activity_1950_1990 <- aer_1950_1990_TBtu %>%
+  mutate(
+    across(
+      c(Coal, Oil, Gas),
+      ~ .x * TBtu_to_GJ
+    )
+  )
+
+# Average the available annual activity observations within each decade.
+ap42_activity_decadal <- bind_rows(
+  activity_1940s,
+  activity_1950_1990
+) %>%
+  filter(
+    year >= min(decade_years),
+    year <= max(decade_years)
+  ) %>%
+  mutate(
+    analysis_year = floor(year / 10) * 10
+  ) %>%
+  group_by(analysis_year) %>%
+  summarise(
+    across(
+      c(Coal, Oil, Gas),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_activity_years = n(),
+    .groups = "drop"
+  ) %>%
+  rename(year = analysis_year)
+
+stopifnot(
+  identical(ap42_activity_decadal$year, decade_years),
+  identical(
+    ap42_activity_decadal$n_activity_years,
+    c(10L, 2L, 2L, 6L, 6L, 1L)
+  )
+)
+
+# Fuel-specific baseline emission factors.
+ap42_EF <- tidyr::expand_grid(
+  year = decade_years,
+  fuel = c("Coal", "Gas", "Oil")
+) %>%
+  mutate(
+    HHV_GJ_per_metric_t = case_when(
+      fuel == "Coal" ~ HHV_coal_GJt[as.character(year)],
+      fuel == "Oil" ~ 42,
+      fuel == "Gas" ~ 50,
+      TRUE ~ NA_real_
+    ),
+    EF_SO2_kg_per_GJ = ef_so2_from_sulfur(
+      SO2_sulfur_fraction[fuel],
+      HHV_GJ_per_metric_t
+    ),
+    EF_NOx_kg_per_GJ = ef_lbMMBtu_to_kgGJ(
+      NOx_lb_per_MMBtu[fuel]
+    )
+  )
+
+# One authoritative AP-42 table for both panels.
+ap42_by_fuel <- ap42_activity_decadal %>%
+  select(year, Coal, Gas, Oil) %>%
+  pivot_longer(
+    cols = c(Coal, Gas, Oil),
+    names_to = "fuel",
+    values_to = "activity_GJ"
+  ) %>%
+  left_join(
+    ap42_EF,
+    by = c("year", "fuel")
+  ) %>%
+  transmute(
+    year,
+    fuel,
+    SO2_kst =
+      activity_GJ * EF_SO2_kg_per_GJ / kg_per_kst,
+    NOx_kst =
+      activity_GJ * EF_NOx_kg_per_GJ / kg_per_kst
+  )
+
+ap42_totals <- ap42_by_fuel %>%
+  group_by(year) %>%
+  summarise(
+    SO2_kst = sum(SO2_kst),
+    NOx_kst = sum(NOx_kst),
+    .groups = "drop"
+  )
+
+ap42_fuel_SO2 <- ap42_by_fuel %>%
+  select(year, fuel, SO2_kst) %>%
+  pivot_wider(
+    names_from = fuel,
+    values_from = SO2_kst
+  )
+
+ap42_fuel_NOx <- ap42_by_fuel %>%
+  select(year, fuel, NOx_kst) %>%
+  pivot_wider(
+    names_from = fuel,
+    values_from = NOx_kst
+  )
+
+ap42_SO2_kst <- ap42_totals$SO2_kst
+ap42_NOx_kst <- ap42_totals$NOx_kst
+
+stopifnot(
+  identical(ap42_totals$year, decade_years),
+  !anyNA(ap42_by_fuel),
+  all(ap42_SO2_kst >= 0),
+  all(ap42_NOx_kst >= 0)
+)
+
+# ================================================================
+# 4. Panel (a): national totals
 # ================================================================
 
 # EPA national estimates
@@ -170,26 +387,6 @@ epa_NOx_Tg <- c(
 
 epa_SO2_Tg <- c(
   2.2, 4.1, 8.4, 15.8, 15.5, 14.2
-)
-
-# AP-42 emission factors × historical fuel consumption
-# Units: thousand short tons
-ap42_NOx_kst <- c(
-  541.4,
-  955.3,
-  1698.0,
-  3609.0,
-  4645.0,
-  5146.0
-)
-
-ap42_SO2_kst <- c(
-  3238.06,
-  5591.58,
-  9539.0,
-  13461.0,
-  14746.0,
-  14786.0
 )
 
 # Facility emission factors × reconstructed generation
@@ -347,30 +544,11 @@ figure1a <- ggplot(
   theme_publication(base_size = 10)
 
 # ================================================================
-# 4. Panel (b): fuel-specific comparison
+# 5. Panel (b): fuel-specific comparison
 # ================================================================
 
-# AP-42 replication
-# Units: thousand short tons
-ap42_fuel_NOx <- tribble(
-  ~year, ~Coal, ~Gas, ~Oil,
-  1940,   424,   32.8,  31.6,
-  1950,   707,   69.2,  82.5,
-  1960,  1256,  157.0, 112.0,
-  1970,  2396,  258.0, 581.0,
-  1980,  3687,  236.0, 267.0,
-  1990,  4119,  284.0, 239.0
-)
-
-ap42_fuel_SO2 <- tribble(
-  ~year, ~Coal, ~Gas, ~Oil,
-  1940,  3034,  4.06,  200,
-  1950,  5061,  8.58,  522,
-  1960,  8990, 19.40,  635,
-  1970, 16047, 32.00, 2759,
-  1980, 21441, 29.30,  846,
-  1990, 20760, 35.30,  757
-)
+# AP-42 estimates were calculated above panel (a), allowing both
+# pollutants and both panels to share one authoritative source.
 
 # Facility reconstruction
 # Original units: short tons
@@ -474,6 +652,68 @@ stopifnot(
   all(figure1b_data$emissions_kst >= 0)
 )
 
+# Logical cross-panel check: a fuel-specific estimate must never exceed
+# the corresponding national estimate for the same year, pollutant, and
+# method. This catches the inconsistency identified in the review.
+national_component_check <- figure1b_data %>%
+  left_join(
+    figure1a_data %>%
+      select(
+        year,
+        pollutant,
+        series,
+        national_emissions_kst = emissions_kst
+      ),
+    by = c(
+      "year",
+      "pollutant",
+      "series"
+    )
+  ) %>%
+  mutate(
+    component_within_national =
+      emissions_kst <= national_emissions_kst + 1e-8
+  )
+
+stopifnot(
+  !anyNA(national_component_check$national_emissions_kst),
+  all(national_component_check$component_within_national)
+)
+
+# Stronger AP-42 check: each national series must exactly equal the sum
+# of the coal, gas, and oil series shown in panel (b).
+ap42_cross_panel_check <- figure1b_data %>%
+  filter(
+    series == "AP-42 replication"
+  ) %>%
+  group_by(year, pollutant) %>%
+  summarise(
+    fuel_sum_kst = sum(emissions_kst),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    figure1a_data %>%
+      filter(
+        series == "AP-42 replication"
+      ) %>%
+      transmute(
+        year,
+        pollutant,
+        national_emissions_kst = emissions_kst
+      ),
+    by = c("year", "pollutant")
+  )
+
+stopifnot(
+  isTRUE(
+    all.equal(
+      ap42_cross_panel_check$fuel_sum_kst,
+      ap42_cross_panel_check$national_emissions_kst,
+      tolerance = 1e-8
+    )
+  )
+)
+
 # Draw panel (b)
 figure1b <- ggplot(
   figure1b_data,
@@ -560,7 +800,7 @@ figure1b <- ggplot(
   )
 
 # ================================================================
-# 5. Combine panels (a) and (b)
+# 6. Combine panels (a) and (b)
 # ================================================================
 
 figure1_combined <- patchwork::wrap_plots(
@@ -599,7 +839,7 @@ figure1_combined <- patchwork::wrap_plots(
 print(figure1_combined)
 
 # ================================================================
-# 6. Save final Figure 1
+# 7. Save final Figure 1
 # ================================================================
 
 # TIFF: 600 dpi
@@ -635,3 +875,7 @@ message(
   "Figure 1 saved to: ",
   normalizePath(output_dir)
 )
+
+
+
+ 
