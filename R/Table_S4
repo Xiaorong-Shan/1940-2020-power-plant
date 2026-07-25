@@ -1,0 +1,2021 @@
+# ==============================================================================
+# Power-plant SO2/NOx model rebuild for Table S4
+#
+# This script performs, in one run:
+#   1. CAMPD data assembly and emission-factor calculation;
+#   2. facility-level 80:20 development/independent-holdout split;
+#   3. five-fold facility-grouped cross-validation on the development set;
+#   4. independent holdout evaluation on the original g/kWh scale;
+#   5. final refit using all modern facilities;
+#   6. historical 1940-1990 generator predictions with CF = 0.95;
+#   7. generator- and facility-level historical emissions outputs;
+#   8. a low-cost CF = 0.50 sensitivity summary; and
+#   9. ready-to-copy Table S4 values and Results text.
+#
+# The holdout facilities are never used for tuning, early stopping, or selection.
+# The inverse of log10(EF + 1) is correctly calculated as 10^z - 1.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. USER SETTINGS
+# ------------------------------------------------------------------------------
+
+# All paths below are fixed local Mac paths taken directly from the original
+# SO2/NOx scripts. This script does not search for input files and does not
+# switch to another directory when a path is missing.
+FACILITY_INFO_FILE <- "/Users/xshan2/OneDrive - George Mason University - O365 Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/EF_pp_paper_code/data/facility-attributes-1995-2020-CAMPD.csv"
+
+FACILITY_EMISSION_FILE <- "/Users/xshan2/OneDrive - George Mason University - O365 Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/EF_pp_paper_code/data/annual-emissions-facility-aggregation-1995-2020-CAMPD.csv"
+
+HISTORICAL_GENERATOR_FILE <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/december_generator2022.xlsx"
+
+# The December 2022 workbook already supplies plant coordinates. No separate
+# generator2010_gen.csv input is required for this rebuild.
+HISTORICAL_LOCATION_FILE <- NA_character_
+
+OUT_DIR <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/03_powerplant/data/TableS4_full_rebuild"
+
+SEED <- 123L
+DEVELOPMENT_FRACTION <- 0.80
+N_FOLDS <- 5L
+MAX_EF_G_PER_KWH <- 10
+MAX_BOOSTING_ROUNDS <- 500L
+EARLY_STOPPING_PATIENCE <- 20L
+PRIMARY_CAPACITY_FACTOR <- 0.95
+SENSITIVITY_CAPACITY_FACTORS <- c(0.50)
+TARGET_YEARS <- c(1940L, 1950L, 1960L, 1970L, 1980L, 1990L)
+GRAMS_PER_SHORT_TON <- 907184.74
+
+NTHREAD <- suppressWarnings(as.integer(Sys.getenv("PP_NTHREAD", unset = "8")))
+if (is.na(NTHREAD) || NTHREAD < 1L) {
+  NTHREAD <- 8L
+}
+detected_cores <- parallel::detectCores(logical = FALSE)
+if (!is.na(detected_cores)) {
+  NTHREAD <- min(NTHREAD, detected_cores)
+}
+
+# A compact, prespecified tuning grid. The legacy setting is configuration 4.
+TUNING_GRID <- data.table::data.table(
+  config_id = 1:4,
+  max_depth = c(3L, 3L, 6L, 6L),
+  eta = c(0.03, 0.05, 0.03, 0.05),
+  min_child_weight = c(5, 1, 5, 1),
+  gamma = c(0, 0, 0, 0),
+  subsample = c(0.70, 0.70, 0.70, 0.70),
+  colsample_bytree = c(0.70, 0.70, 0.70, 0.70),
+  lambda = c(1, 1, 1, 1),
+  alpha = c(0, 0, 0, 0)
+)
+
+# ------------------------------------------------------------------------------
+# 1. PACKAGES AND GENERAL HELPERS
+# ------------------------------------------------------------------------------
+
+required_packages <- c("data.table", "readxl", "xgboost")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    "\nInstall them before rerunning the script."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(xgboost)
+})
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+set.seed(SEED)
+RUN_STARTED_AT <- Sys.time()
+
+# A completion marker from an earlier attempt must never be mistaken for a
+# successful current run.
+unlink(file.path(OUT_DIR, "RUN_COMPLETE.txt"), force = TRUE)
+
+message("Output directory:  ", normalizePath(OUT_DIR, mustWork = FALSE))
+message("XGBoost threads:    ", NTHREAD)
+
+normalize_name <- function(x) {
+  tolower(gsub("[^a-z0-9]", "", x))
+}
+
+pick_column <- function(
+  column_names,
+  candidates,
+  label,
+  required = TRUE
+) {
+  normalized_names <- normalize_name(column_names)
+  normalized_candidates <- normalize_name(candidates)
+  hit_position <- match(normalized_candidates, normalized_names)
+  hit_position <- hit_position[!is.na(hit_position)]
+
+  if (length(hit_position) == 0L) {
+    if (required) {
+      related <- grep(
+        paste(c("facility", "oris", "plant", "unit"), collapse = "|"),
+        column_names,
+        value = TRUE,
+        ignore.case = TRUE
+      )
+      stop(
+        "Could not identify ", label, ".\n",
+        "Candidate columns in the data were:\n  ",
+        paste(related, collapse = "\n  ")
+      )
+    }
+    return(NA_character_)
+  }
+
+  column_names[hit_position[1L]]
+}
+
+column_or_default <- function(
+  dt,
+  candidates,
+  default = NA,
+  required = FALSE,
+  label = "column"
+) {
+  hit <- pick_column(names(dt), candidates, label, required = required)
+  if (is.na(hit)) {
+    return(rep(default, nrow(dt)))
+  }
+  dt[[hit]]
+}
+
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x) & nzchar(trimws(as.character(x)))]
+  if (length(x) == 0L) NA_character_ else as.character(x[1L])
+}
+
+weighted_mean_available <- function(x, w) {
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  stats::weighted.mean(x[keep], w[keep])
+}
+
+predictive_metrics <- function(observed, predicted) {
+  keep <- is.finite(observed) & is.finite(predicted)
+  observed <- observed[keep]
+  predicted <- predicted[keep]
+
+  if (length(observed) < 2L) {
+    stop("Fewer than two finite holdout predictions were available.")
+  }
+
+  denominator <- sum((observed - mean(observed))^2)
+  predictive_r2 <- if (denominator > 0) {
+    1 - sum((observed - predicted)^2) / denominator
+  } else {
+    NA_real_
+  }
+
+  data.table(
+    n = length(observed),
+    MAE_g_per_kWh = mean(abs(predicted - observed)),
+    RMSE_g_per_kWh = sqrt(mean((predicted - observed)^2)),
+    predictive_R2 = predictive_r2,
+    mean_bias_g_per_kWh = mean(predicted - observed)
+  )
+}
+
+align_matrix <- function(matrix_to_align, target_columns) {
+  missing_columns <- setdiff(target_columns, colnames(matrix_to_align))
+  if (length(missing_columns) > 0L) {
+    zeros <- matrix(
+      0,
+      nrow = nrow(matrix_to_align),
+      ncol = length(missing_columns),
+      dimnames = list(NULL, missing_columns)
+    )
+    matrix_to_align <- cbind(matrix_to_align, zeros)
+  }
+
+  extra_columns <- setdiff(colnames(matrix_to_align), target_columns)
+  if (length(extra_columns) > 0L) {
+    matrix_to_align <- matrix_to_align[
+      ,
+      setdiff(colnames(matrix_to_align), extra_columns),
+      drop = FALSE
+    ]
+  }
+
+  matrix_to_align[, target_columns, drop = FALSE]
+}
+
+get_xgb_callback_result <- function(model, result_name) {
+  # XGBoost 3.x stores callback results (including evaluation_log and
+  # early_stop) as R attributes on the xgb.Booster object. Older releases
+  # exposed some of them as list elements. Check both representations.
+  result <- attr(model, result_name, exact = TRUE)
+  if (!is.null(result)) {
+    return(result)
+  }
+
+  tryCatch(
+    model[[result_name]],
+    error = function(e) NULL
+  )
+}
+
+get_xgb_evaluation_log <- function(model) {
+  evaluation_log <- get_xgb_callback_result(model, "evaluation_log")
+  if (is.null(evaluation_log) || length(evaluation_log) == 0L) {
+    stop(
+      "XGBoost did not return an evaluation log even though validation data ",
+      "were supplied. Installed XGBoost version: ",
+      as.character(utils::packageVersion("xgboost"))
+    )
+  }
+
+  evaluation_log <- data.table::as.data.table(evaluation_log)
+  if (nrow(evaluation_log) == 0L || ncol(evaluation_log) == 0L) {
+    stop(
+      "XGBoost returned an empty evaluation log. Installed XGBoost version: ",
+      as.character(utils::packageVersion("xgboost"))
+    )
+  }
+  evaluation_log
+}
+
+validation_rmse_column <- function(
+  evaluation_log,
+  validation_name = "validation"
+) {
+  log_names <- names(evaluation_log)
+  normalized_names <- normalize_name(log_names)
+  preferred_names <- normalize_name(c(
+    paste0(validation_name, "_rmse"),
+    "validation_rmse",
+    "valid_rmse",
+    "test_rmse"
+  ))
+
+  preferred_position <- match(preferred_names, normalized_names)
+  preferred_position <- preferred_position[!is.na(preferred_position)]
+  if (length(preferred_position) > 0L) {
+    return(log_names[preferred_position[1L]])
+  }
+
+  # Compatibility fallback for XGBoost releases that alter separators or
+  # evaluation-set prefixes.
+  candidate_position <- which(
+    grepl("rmse$", normalized_names) &
+      !grepl("train", normalized_names)
+  )
+  if (length(candidate_position) == 1L) {
+    return(log_names[candidate_position])
+  }
+
+  stop(
+    "Could not identify validation RMSE in the XGBoost evaluation log.\n",
+    "Available evaluation-log columns were:\n  ",
+    paste(log_names, collapse = "\n  ")
+  )
+}
+
+early_stopping_result_from_model <- function(
+  model,
+  validation_name = "validation"
+) {
+  evaluation_log <- get_xgb_evaluation_log(model)
+  metric_column <- validation_rmse_column(
+    evaluation_log,
+    validation_name
+  )
+  metric_values <- suppressWarnings(
+    as.numeric(evaluation_log[[metric_column]])
+  )
+  if (!any(is.finite(metric_values))) {
+    stop(
+      "The validation RMSE column contained no finite values: ",
+      metric_column
+    )
+  }
+
+  best_iteration <- which.min(metric_values)
+
+  list(
+    best_iteration = as.integer(best_iteration),
+    best_validation_rmse = metric_values[best_iteration],
+    metric_column = metric_column
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 2. CHECK FIXED INPUT PATHS
+# ------------------------------------------------------------------------------
+
+required_input_files <- c(
+  FACILITY_INFO_FILE,
+  FACILITY_EMISSION_FILE,
+  HISTORICAL_GENERATOR_FILE
+)
+missing_input_files <- required_input_files[!file.exists(required_input_files)]
+if (length(missing_input_files) > 0L) {
+  stop(
+    "The following fixed input path(s) do not exist:\n  ",
+    paste(missing_input_files, collapse = "\n  "),
+    "\nEdit only the path definitions in Section 0 if a file was moved."
+  )
+}
+
+input_manifest <- data.table(
+  input = c(
+    "CAMPD facility attributes",
+    "CAMPD annual emissions",
+    "Historical generator inventory",
+    "Historical location crosswalk"
+  ),
+  path = c(
+    FACILITY_INFO_FILE,
+    FACILITY_EMISSION_FILE,
+    HISTORICAL_GENERATOR_FILE,
+    HISTORICAL_LOCATION_FILE
+  )
+)
+fwrite(input_manifest, file.path(OUT_DIR, "input_file_manifest.csv"))
+print(input_manifest)
+
+# ------------------------------------------------------------------------------
+# 3. LOAD AND MERGE CAMPD DATA
+# ------------------------------------------------------------------------------
+
+message("\nLoading CAMPD inputs...")
+facility_info <- data.table::fread(
+  FACILITY_INFO_FILE,
+  data.table = FALSE,
+  check.names = TRUE
+)
+facility_emission <- data.table::fread(
+  FACILITY_EMISSION_FILE,
+  data.table = FALSE,
+  check.names = TRUE
+)
+
+common_columns <- intersect(names(facility_info), names(facility_emission))
+if (length(common_columns) == 0L) {
+  stop("The two CAMPD files have no shared columns for merging.")
+}
+
+message(
+  "Merging CAMPD files using ", length(common_columns),
+  " shared column(s): ", paste(common_columns, collapse = ", ")
+)
+
+campd_all <- unique(
+  merge(
+    facility_info,
+    facility_emission,
+    by = common_columns,
+    all = FALSE
+  )
+)
+data.table::setDT(campd_all)
+
+facility_id_column <- pick_column(
+  names(campd_all),
+  c(
+    "Facility.ID",
+    "FacilityID",
+    "Facility.ID..ORISPL.",
+    "Facility ID (ORISPL)",
+    "ORISPL.Code",
+    "ORISPL Code",
+    "ORIS.Code",
+    "ORISPL",
+    "Plant.Code",
+    "Plant.ID",
+    "Facility.Code"
+  ),
+  label = "the CAMPD facility identifier"
+)
+message("Facility grouping column: ", facility_id_column)
+
+# Required CAMPD fields used by both models.
+required_campd_columns <- c(
+  "Commercial.Operation.Date",
+  "Primary.Fuel.Type",
+  "Unit.Type",
+  "Year",
+  "Gross.Load..MWh.",
+  "SO2.Mass..short.tons.",
+  "NOx.Mass..short.tons.",
+  "SO2.Controls",
+  "NOx.Controls"
+)
+missing_campd_columns <- setdiff(required_campd_columns, names(campd_all))
+if (length(missing_campd_columns) > 0L) {
+  stop(
+    "The merged CAMPD data are missing required fields:\n  ",
+    paste(missing_campd_columns, collapse = "\n  ")
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4. BUILD POLLUTANT-SPECIFIC MODEL DATA
+# ------------------------------------------------------------------------------
+
+fuel_category <- function(x) {
+  x <- as.character(x)
+  answer <- rep("Other", length(x))
+  answer[grepl("coal", x, ignore.case = TRUE)] <- "Coal"
+  answer[grepl("gas", x, ignore.case = TRUE)] <- "Gas"
+  answer[
+    grepl("oil|diesel|petroleum", x, ignore.case = TRUE)
+  ] <- "Oil"
+  answer[grepl("wood|biomass", x, ignore.case = TRUE)] <- "Biomass"
+  answer
+}
+
+flag_pattern <- function(x, pattern) {
+  as.integer(
+    !is.na(x) &
+      grepl(pattern, x, ignore.case = TRUE, perl = TRUE)
+  )
+}
+
+prepare_pollutant_data <- function(pollutant) {
+  pollutant <- toupper(pollutant)
+  if (!pollutant %in% c("SO2", "NOX")) {
+    stop("pollutant must be SO2 or NOX")
+  }
+
+  dt <- data.table::copy(campd_all)
+  operation_date <- as.Date(dt[["Commercial.Operation.Date"]])
+  gross_generation_kwh <- as.numeric(dt[["Gross.Load..MWh."]]) * 1000
+
+  if (pollutant == "SO2") {
+    mass_tons <- as.numeric(dt[["SO2.Mass..short.tons."]])
+    controls_text <- as.character(dt[["SO2.Controls"]])
+    control_columns <- c("SO2_FGD", "SO2_SDA", "SO2_DSI")
+  } else {
+    mass_tons <- as.numeric(dt[["NOx.Mass..short.tons."]])
+    controls_text <- as.character(dt[["NOx.Controls"]])
+    control_columns <- c("NOx_SCR", "NOx_SNCR", "NOx_LNB", "NOx_OFA")
+  }
+
+  mass_grams <- mass_tons * GRAMS_PER_SHORT_TON
+  ef <- mass_grams / gross_generation_kwh
+
+  model_dt <- data.table(
+    facility_id = as.character(dt[[facility_id_column]]),
+    convert_fuel = fuel_category(dt[["Primary.Fuel.Type"]]),
+    Unit.Type = trimws(
+      gsub("\\s*\\(.*?\\)", "", as.character(dt[["Unit.Type"]]))
+    ),
+    Year = as.integer(dt[["Year"]]),
+    gross_generation_kWh = gross_generation_kwh,
+    log_Gen_kWh = log10(gross_generation_kwh + 1),
+    EF = ef,
+    log_EF = log10(ef + 1),
+    operation_date = operation_date
+  )
+
+  if (pollutant == "SO2") {
+    # FGD is intentionally broad; SDA and DSI remain separate indicators.
+    model_dt[, SO2_FGD := flag_pattern(
+      controls_text,
+      "scrubber|flue.?gas.?desul|\\bFGD\\b"
+    )]
+    model_dt[, SO2_SDA := flag_pattern(
+      controls_text,
+      "spray.?dryer|spray.?dry|\\bSDA\\b"
+    )]
+    model_dt[, SO2_DSI := flag_pattern(
+      controls_text,
+      "dry.?sorbent|\\bDSI\\b"
+    )]
+  } else {
+    model_dt[, NOx_SCR := flag_pattern(
+      controls_text,
+      "selective.?catalytic|\\bSCR\\b"
+    )]
+    model_dt[, NOx_SNCR := flag_pattern(
+      controls_text,
+      "selective.?non.?catalytic|\\bSNCR\\b"
+    )]
+    model_dt[, NOx_LNB := flag_pattern(
+      controls_text,
+      "low.?NOx|low.?nitrogen|\\bLNB\\b"
+    )]
+    model_dt[, NOx_OFA := flag_pattern(
+      controls_text,
+      "over.?fire.?air|\\bOFA\\b"
+    )]
+  }
+
+  n_before <- nrow(model_dt)
+
+  model_dt <- model_dt[
+    !is.na(operation_date) &
+      operation_date > as.Date("1939-12-31") &
+      !is.na(facility_id) &
+      nzchar(facility_id) &
+      !is.na(Unit.Type) &
+      nzchar(Unit.Type) &
+      is.finite(Year) &
+      Year >= 1995L &
+      Year <= 2020L &
+      is.finite(gross_generation_kWh) &
+      gross_generation_kWh > 0 &
+      is.finite(EF) &
+      EF >= 0 &
+      EF < MAX_EF_G_PER_KWH &
+      is.finite(log_EF)
+  ]
+
+  if (nrow(model_dt) == 0L) {
+    stop("No usable ", pollutant, " records remained after cleaning.")
+  }
+
+  fuel_levels <- sort(unique(model_dt$convert_fuel))
+  unit_levels <- sort(unique(model_dt$Unit.Type))
+  model_dt[, convert_fuel := factor(convert_fuel, levels = fuel_levels)]
+  model_dt[, Unit.Type := factor(Unit.Type, levels = unit_levels)]
+
+  control_counts <- model_dt[
+    ,
+    lapply(.SD, sum, na.rm = TRUE),
+    .SDcols = control_columns
+  ]
+  active_control_columns <- control_columns[
+    vapply(
+      control_columns,
+      function(column_name) {
+        sum(model_dt[[column_name]], na.rm = TRUE) > 0
+      },
+      logical(1)
+    )
+  ]
+  inactive_control_columns <- setdiff(
+    control_columns,
+    active_control_columns
+  )
+  if (length(inactive_control_columns) > 0L) {
+    warning(
+      pollutant,
+      " control predictor(s) had zero positive records and were excluded: ",
+      paste(inactive_control_columns, collapse = ", ")
+    )
+  }
+
+  qa <- data.table(
+    pollutant = pollutant,
+    merged_records = nrow(campd_all),
+    records_before_cleaning = n_before,
+    records_after_cleaning = nrow(model_dt),
+    records_removed = n_before - nrow(model_dt),
+    facilities_after_cleaning = uniqueN(model_dt$facility_id),
+    fuel_levels = paste(fuel_levels, collapse = " | "),
+    unit_type_levels = length(unit_levels),
+    facility_id_column = facility_id_column,
+    max_EF_filter_g_per_kWh = MAX_EF_G_PER_KWH
+  )
+
+  list(
+    pollutant = pollutant,
+    data = model_dt,
+    controls = active_control_columns,
+    inactive_controls = inactive_control_columns,
+    control_counts = control_counts,
+    fuel_levels = fuel_levels,
+    unit_levels = unit_levels,
+    qa = qa
+  )
+}
+
+so2_prepared <- prepare_pollutant_data("SO2")
+nox_prepared <- prepare_pollutant_data("NOX")
+
+qa_counts <- rbindlist(list(so2_prepared$qa, nox_prepared$qa), fill = TRUE)
+fwrite(qa_counts, file.path(OUT_DIR, "TableS4_data_QA.csv"))
+
+control_counts <- rbindlist(
+  list(
+    cbind(pollutant = "SO2", so2_prepared$control_counts),
+    cbind(pollutant = "NOx", nox_prepared$control_counts)
+  ),
+  fill = TRUE
+)
+fwrite(control_counts, file.path(OUT_DIR, "control_indicator_counts.csv"))
+
+print(qa_counts)
+print(control_counts)
+
+# ------------------------------------------------------------------------------
+# 5. FACILITY-GROUPED SPLIT, CROSS-VALIDATION, AND HOLDOUT EVALUATION
+# ------------------------------------------------------------------------------
+
+make_facility_split <- function(facility_ids, development_fraction, seed) {
+  facilities <- sort(unique(as.character(facility_ids)))
+  if (length(facilities) < 10L) {
+    stop("At least 10 facilities are required for a stable 80:20 split.")
+  }
+
+  set.seed(seed)
+  shuffled <- sample(facilities, length(facilities), replace = FALSE)
+  n_development <- floor(development_fraction * length(shuffled))
+  n_development <- max(1L, min(n_development, length(shuffled) - 1L))
+
+  list(
+    development = shuffled[seq_len(n_development)],
+    holdout = shuffled[(n_development + 1L):length(shuffled)]
+  )
+}
+
+assign_facility_folds <- function(facility_ids, k, seed) {
+  facilities <- sort(unique(as.character(facility_ids)))
+  if (length(facilities) < k) {
+    stop("Fewer development facilities than requested CV folds.")
+  }
+
+  set.seed(seed)
+  shuffled <- sample(facilities, length(facilities), replace = FALSE)
+  assigned <- data.table(
+    facility_id = shuffled,
+    fold = rep(seq_len(k), length.out = length(shuffled))
+  )
+  assigned
+}
+
+build_design_matrix <- function(dt, controls) {
+  rhs <- paste(
+    c("convert_fuel", "Unit.Type", "Year", "log_Gen_kWh", controls),
+    collapse = " + "
+  )
+  formula_object <- stats::as.formula(paste("~", rhs, "- 1"))
+  list(
+    formula = formula_object,
+    matrix = stats::model.matrix(formula_object, data = dt)
+  )
+}
+
+run_pollutant_model <- function(prepared, seed_offset = 0L) {
+  pollutant <- prepared$pollutant
+  dt <- data.table::copy(prepared$data)
+  controls <- prepared$controls
+
+  message("\n============================================================")
+  message("Running ", pollutant, " facility-grouped model")
+  message("============================================================")
+
+  split <- make_facility_split(
+    dt$facility_id,
+    DEVELOPMENT_FRACTION,
+    SEED + seed_offset
+  )
+  dt[, partition := ifelse(
+    facility_id %in% split$development,
+    "development",
+    "holdout"
+  )]
+
+  overlap <- intersect(split$development, split$holdout)
+  if (length(overlap) > 0L) {
+    stop("Facility leakage detected between development and holdout sets.")
+  }
+
+  fold_assignment <- assign_facility_folds(
+    split$development,
+    N_FOLDS,
+    SEED + 100L + seed_offset
+  )
+  dt <- merge(dt, fold_assignment, by = "facility_id", all.x = TRUE)
+
+  design <- build_design_matrix(dt, controls)
+  X_all <- design$matrix
+  y_all <- dt$log_EF
+  development_rows <- which(dt$partition == "development")
+  holdout_rows <- which(dt$partition == "holdout")
+
+  if (length(holdout_rows) == 0L) {
+    stop("No holdout rows were created for ", pollutant)
+  }
+
+  cv_results <- vector(
+    "list",
+    nrow(TUNING_GRID) * N_FOLDS
+  )
+  cv_counter <- 0L
+
+  for (config_row in seq_len(nrow(TUNING_GRID))) {
+    cfg <- TUNING_GRID[config_row]
+    message(
+      pollutant, " tuning config ", cfg$config_id,
+      "/", nrow(TUNING_GRID),
+      ": depth=", cfg$max_depth,
+      ", eta=", cfg$eta,
+      ", min_child_weight=", cfg$min_child_weight
+    )
+
+    params <- list(
+      objective = "reg:squarederror",
+      eval_metric = "rmse",
+      max_depth = cfg$max_depth,
+      eta = cfg$eta,
+      min_child_weight = cfg$min_child_weight,
+      gamma = cfg$gamma,
+      subsample = cfg$subsample,
+      colsample_bytree = cfg$colsample_bytree,
+      lambda = cfg$lambda,
+      alpha = cfg$alpha,
+      nthread = NTHREAD,
+      seed = SEED + config_row + seed_offset
+    )
+
+    for (fold_number in seq_len(N_FOLDS)) {
+      validation_rows <- development_rows[
+        dt$fold[development_rows] == fold_number
+      ]
+      training_rows <- development_rows[
+        dt$fold[development_rows] != fold_number
+      ]
+
+      dtrain <- xgb.DMatrix(
+        data = X_all[training_rows, , drop = FALSE],
+        label = y_all[training_rows]
+      )
+      dvalid <- xgb.DMatrix(
+        data = X_all[validation_rows, , drop = FALSE],
+        label = y_all[validation_rows]
+      )
+
+      cv_model <- xgb.train(
+        params = params,
+        data = dtrain,
+        nrounds = MAX_BOOSTING_ROUNDS,
+        evals = list(training = dtrain, validation = dvalid),
+        early_stopping_rounds = EARLY_STOPPING_PATIENCE,
+        verbose = 0
+      )
+
+      early_stopping_result <- early_stopping_result_from_model(
+        cv_model,
+        "validation"
+      )
+      best_iteration <- early_stopping_result$best_iteration
+      best_validation_rmse <-
+        early_stopping_result$best_validation_rmse
+
+      cv_counter <- cv_counter + 1L
+      cv_results[[cv_counter]] <- data.table(
+        pollutant = pollutant,
+        config_id = cfg$config_id,
+        fold = fold_number,
+        development_training_facilities = uniqueN(
+          dt$facility_id[training_rows]
+        ),
+        internal_validation_facilities = uniqueN(
+          dt$facility_id[validation_rows]
+        ),
+        development_training_records = length(training_rows),
+        internal_validation_records = length(validation_rows),
+        best_iteration = best_iteration,
+        best_validation_RMSE_log10 = best_validation_rmse,
+        max_depth = cfg$max_depth,
+        eta = cfg$eta,
+        min_child_weight = cfg$min_child_weight,
+        gamma = cfg$gamma,
+        subsample = cfg$subsample,
+        colsample_bytree = cfg$colsample_bytree,
+        lambda = cfg$lambda,
+        alpha = cfg$alpha
+      )
+
+      rm(cv_model, dtrain, dvalid)
+      invisible(gc())
+    }
+  }
+
+  cv_results <- rbindlist(cv_results[seq_len(cv_counter)], fill = TRUE)
+  cv_summary <- cv_results[
+    ,
+    .(
+      mean_validation_RMSE_log10 = mean(best_validation_RMSE_log10),
+      sd_validation_RMSE_log10 = stats::sd(best_validation_RMSE_log10),
+      median_best_iteration = as.integer(
+        round(stats::median(best_iteration))
+      ),
+      min_best_iteration = min(best_iteration),
+      max_best_iteration = max(best_iteration)
+    ),
+    by = .(
+      pollutant,
+      config_id,
+      max_depth,
+      eta,
+      min_child_weight,
+      gamma,
+      subsample,
+      colsample_bytree,
+      lambda,
+      alpha
+    )
+  ][order(mean_validation_RMSE_log10, config_id)]
+
+  selected <- cv_summary[1L]
+  selected_rounds <- max(1L, selected$median_best_iteration)
+  message(
+    pollutant, " selected config ", selected$config_id,
+    " with ", selected_rounds, " boosting rounds."
+  )
+
+  selected_params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    max_depth = selected$max_depth,
+    eta = selected$eta,
+    min_child_weight = selected$min_child_weight,
+    gamma = selected$gamma,
+    subsample = selected$subsample,
+    colsample_bytree = selected$colsample_bytree,
+    lambda = selected$lambda,
+    alpha = selected$alpha,
+    nthread = NTHREAD,
+    seed = SEED + 1000L + seed_offset
+  )
+
+  # Final evaluation model: development facilities only.
+  ddevelopment <- xgb.DMatrix(
+    X_all[development_rows, , drop = FALSE],
+    label = y_all[development_rows]
+  )
+  evaluation_model <- xgb.train(
+    params = selected_params,
+    data = ddevelopment,
+    nrounds = selected_rounds,
+    verbose = 0
+  )
+
+  dholdout <- xgb.DMatrix(
+    X_all[holdout_rows, , drop = FALSE],
+    label = y_all[holdout_rows]
+  )
+  holdout_prediction_log <- predict(evaluation_model, dholdout)
+
+  # Correct inverse transformation for log10(EF + 1).
+  observed_ef <- pmax(0, 10^y_all[holdout_rows] - 1)
+  predicted_ef <- pmax(0, 10^holdout_prediction_log - 1)
+  metrics <- predictive_metrics(observed_ef, predicted_ef)
+
+  holdout_predictions <- data.table(
+    pollutant = pollutant,
+    facility_id = dt$facility_id[holdout_rows],
+    Year = dt$Year[holdout_rows],
+    convert_fuel = as.character(dt$convert_fuel[holdout_rows]),
+    Unit.Type = as.character(dt$Unit.Type[holdout_rows]),
+    observed_EF_g_per_kWh = observed_ef,
+    predicted_EF_g_per_kWh = predicted_ef,
+    residual_g_per_kWh = predicted_ef - observed_ef
+  )
+
+  # Refit on all modern facilities for historical prediction only.
+  dall <- xgb.DMatrix(X_all, label = y_all)
+  full_model <- xgb.train(
+    params = selected_params,
+    data = dall,
+    nrounds = selected_rounds,
+    verbose = 0
+  )
+
+  development_facilities <- uniqueN(dt$facility_id[development_rows])
+  holdout_facilities <- uniqueN(dt$facility_id[holdout_rows])
+  total_facilities <- uniqueN(dt$facility_id)
+
+  model_summary <- data.table(
+    pollutant = ifelse(pollutant == "NOX", "NOx", pollutant),
+    total_facilities = total_facilities,
+    total_records = nrow(dt),
+    development_facilities = development_facilities,
+    development_records = length(development_rows),
+    holdout_facilities = holdout_facilities,
+    holdout_records = length(holdout_rows),
+    cv_folds = N_FOLDS,
+    tuning_configurations = nrow(TUNING_GRID),
+    selected_config_id = selected$config_id,
+    max_depth = selected$max_depth,
+    eta = selected$eta,
+    min_child_weight = selected$min_child_weight,
+    gamma = selected$gamma,
+    subsample = selected$subsample,
+    colsample_bytree = selected$colsample_bytree,
+    lambda = selected$lambda,
+    alpha = selected$alpha,
+    selected_boosting_rounds = selected_rounds,
+    early_stopping_patience = EARLY_STOPPING_PATIENCE,
+    selection_RMSE_log10 = selected$mean_validation_RMSE_log10,
+    MAE_g_per_kWh = metrics$MAE_g_per_kWh,
+    RMSE_g_per_kWh = metrics$RMSE_g_per_kWh,
+    predictive_R2 = metrics$predictive_R2,
+    mean_bias_g_per_kWh = metrics$mean_bias_g_per_kWh,
+    response = "log10(EF + 1)",
+    back_transformation = "10^predicted_log_EF - 1",
+    control_predictors = paste(controls, collapse = " | ")
+  )
+
+  message(
+    pollutant,
+    " independent holdout: MAE=",
+    format(metrics$MAE_g_per_kWh, digits = 5),
+    ", RMSE=",
+    format(metrics$RMSE_g_per_kWh, digits = 5),
+    ", predictive R2=",
+    format(metrics$predictive_R2, digits = 5),
+    ", mean bias=",
+    format(metrics$mean_bias_g_per_kWh, digits = 5)
+  )
+
+  list(
+    pollutant = pollutant,
+    prepared = prepared,
+    data = dt,
+    formula = design$formula,
+    design_columns = colnames(X_all),
+    cv_results = cv_results,
+    cv_summary = cv_summary,
+    model_summary = model_summary,
+    holdout_predictions = holdout_predictions,
+    evaluation_model = evaluation_model,
+    full_model = full_model,
+    fuel_levels = prepared$fuel_levels,
+    unit_levels = prepared$unit_levels,
+    controls = controls,
+    selected_rounds = selected_rounds
+  )
+}
+
+so2_model_result <- run_pollutant_model(so2_prepared, seed_offset = 0L)
+nox_model_result <- run_pollutant_model(nox_prepared, seed_offset = 10000L)
+
+model_results <- rbindlist(
+  list(
+    so2_model_result$model_summary,
+    nox_model_result$model_summary
+  ),
+  fill = TRUE
+)
+fwrite(model_results, file.path(OUT_DIR, "TableS4_model_results.csv"))
+
+cv_all <- rbindlist(
+  list(so2_model_result$cv_results, nox_model_result$cv_results),
+  fill = TRUE
+)
+fwrite(cv_all, file.path(OUT_DIR, "TableS4_grouped_CV_all_folds.csv"))
+
+cv_summary_all <- rbindlist(
+  list(so2_model_result$cv_summary, nox_model_result$cv_summary),
+  fill = TRUE
+)
+fwrite(cv_summary_all, file.path(OUT_DIR, "TableS4_grouped_CV_summary.csv"))
+
+holdout_all <- rbindlist(
+  list(
+    so2_model_result$holdout_predictions,
+    nox_model_result$holdout_predictions
+  ),
+  fill = TRUE
+)
+fwrite(holdout_all, file.path(OUT_DIR, "TableS4_holdout_predictions.csv"))
+
+xgb.save(
+  so2_model_result$evaluation_model,
+  file.path(OUT_DIR, "SO2_development_only_evaluation.model")
+)
+xgb.save(
+  nox_model_result$evaluation_model,
+  file.path(OUT_DIR, "NOx_development_only_evaluation.model")
+)
+xgb.save(
+  so2_model_result$full_model,
+  file.path(OUT_DIR, "SO2_all_modern_facilities_historical.model")
+)
+xgb.save(
+  nox_model_result$full_model,
+  file.path(OUT_DIR, "NOx_all_modern_facilities_historical.model")
+)
+
+# ------------------------------------------------------------------------------
+# 6. READ AND STANDARDIZE HISTORICAL GENERATOR DATA
+# ------------------------------------------------------------------------------
+
+map_eia_fuel <- function(code) {
+  code <- toupper(trimws(as.character(code)))
+  answer <- rep("Unknown", length(code))
+  answer[code %in% c("BIT", "SUB", "LIG", "RC", "WC", "ANT")] <- "Coal"
+  answer[code %in% c("DFO", "RFO", "JF", "KER", "PC", "WO")] <- "Oil"
+  answer[
+    code %in% c("NG", "OG", "PG", "BFG", "SGC", "SGP", "LFG")
+  ] <- "Gas"
+  answer[
+    code %in% c(
+      "BLQ", "WDS", "WDL", "OBS", "OBL", "OBG", "AB",
+      "MSW", "TDF", "SLW", "PUR"
+    )
+  ] <- "Biomass"
+  answer[
+    code %in% c("WAT", "WND", "SUN", "GEO", "NUC", "WH")
+  ] <- "Renewable"
+  answer
+}
+
+standardize_generator_table <- function(dt, is_active) {
+  data.table::setDT(dt)
+  n <- nrow(dt)
+  prime_mover_candidates <- c(
+    "PRIME_MOVER",
+    "Prime Mover",
+    "Prime.Mover",
+    "Technology",
+    "Unit Type"
+  )
+  prime_mover_column <- pick_column(
+    names(dt),
+    prime_mover_candidates,
+    "historical prime mover or technology",
+    required = FALSE
+  )
+  prime_mover_value <- if (is.na(prime_mover_column)) {
+    rep(NA_character_, n)
+  } else {
+    as.character(dt[[prime_mover_column]])
+  }
+
+  retirement_year <- if (is_active) {
+    rep(NA_integer_, n)
+  } else {
+    as.integer(column_or_default(
+      dt,
+      c("RETIREMENT_YEAR", "Retirement Year", "Retirement.Year"),
+      default = NA_integer_
+    ))
+  }
+
+  data.table(
+    Entity_ID = as.character(column_or_default(
+      dt,
+      c("UTILITY_ID", "Entity ID", "Entity.ID")
+    )),
+    Plant_ID = as.character(column_or_default(
+      dt,
+      c("PLANT_CODE", "Plant ID", "Plant.ID"),
+      required = TRUE,
+      label = "historical Plant ID"
+    )),
+    Plant_Name = as.character(column_or_default(
+      dt,
+      c("PLANT_NAME", "Plant Name", "Plant.Name")
+    )),
+    Plant_State = as.character(column_or_default(
+      dt,
+      c("STATE", "Plant State", "Plant.State")
+    )),
+    County = as.character(column_or_default(
+      dt,
+      c("COUNTY", "County")
+    )),
+    Generator_ID = as.character(column_or_default(
+      dt,
+      c("GENERATOR_ID", "Generator ID", "Generator.ID")
+    )),
+    Prime_Mover = prime_mover_value,
+    Prime_Mover_Source = if (is.na(prime_mover_column)) {
+      NA_character_
+    } else {
+      prime_mover_column
+    },
+    max_capacity_MW = as.numeric(column_or_default(
+      dt,
+      c(
+        "NAMEPLATE",
+        "Nameplate Capacity (MW)",
+        "Nameplate.Capacity..MW."
+      ),
+      required = TRUE,
+      label = "historical nameplate capacity"
+    )),
+    Operating_Year = as.integer(column_or_default(
+      dt,
+      c("OPERATING_YEAR", "Operating Year", "Operating.Year"),
+      required = TRUE,
+      label = "historical operating year"
+    )),
+    Retirement_Year = retirement_year,
+    Energy_Source_Code = as.character(column_or_default(
+      dt,
+      c(
+        "ENERGY_SOURCE_1",
+        "Energy Source Code",
+        "Energy.Source.Code"
+      ),
+      required = TRUE,
+      label = "historical energy-source code"
+    )),
+    Latitude = as.numeric(column_or_default(
+      dt,
+      c("Latitude", "LATITUDE", "Y")
+    )),
+    Longitude = as.numeric(column_or_default(
+      dt,
+      c("Longitude", "LONGITUDE", "X")
+    ))
+  )
+}
+
+read_historical_generators <- function(generator_file, location_file) {
+  sheets <- readxl::excel_sheets(generator_file)
+
+  if (all(c("Exist", "Ret_IP") %in% sheets)) {
+    message("Reading 2010 EIA generator workbook: Exist + Ret_IP")
+    active_raw <- as.data.table(readxl::read_excel(
+      generator_file,
+      sheet = "Exist"
+    ))
+    retired_raw <- as.data.table(readxl::read_excel(
+      generator_file,
+      sheet = "Ret_IP"
+    ))
+  } else {
+    message(
+      "Reading EIA generator workbook using legacy 2022 sheet layout: ",
+      "sheet 1 + sheet 3, skip 2"
+    )
+    active_raw <- as.data.table(readxl::read_excel(
+      generator_file,
+      sheet = 1,
+      skip = 2
+    ))
+    retired_raw <- as.data.table(readxl::read_excel(
+      generator_file,
+      sheet = 3,
+      skip = 2
+    ))
+  }
+
+  active <- standardize_generator_table(active_raw, is_active = TRUE)
+  retired <- standardize_generator_table(retired_raw, is_active = FALSE)
+
+  generators <- unique(
+    rbindlist(list(active, retired), use.names = TRUE, fill = TRUE),
+    by = c(
+      "Plant_ID",
+      "Generator_ID",
+      "Operating_Year",
+      "Retirement_Year",
+      "Energy_Source_Code",
+      "max_capacity_MW",
+      "Prime_Mover",
+      "Prime_Mover_Source"
+    )
+  )
+
+  generators[, convert_fuel := map_eia_fuel(Energy_Source_Code)]
+  generators <- generators[
+    !is.na(Plant_ID) &
+      nzchar(Plant_ID) &
+      is.finite(Operating_Year) &
+      is.finite(max_capacity_MW) &
+      max_capacity_MW > 0
+  ]
+
+  if (!is.na(location_file) && file.exists(location_file)) {
+    message("Joining historical longitude/latitude from: ", location_file)
+    location_raw <- fread(location_file)
+    location_fuel_raw <- as.character(column_or_default(
+      location_raw,
+      c("variable", "convert_fuel", "Fuel"),
+      required = TRUE,
+      label = "location-file fuel category"
+    ))
+    location_fuel <- rep("Unknown", length(location_fuel_raw))
+    location_fuel[
+      grepl("coal", location_fuel_raw, ignore.case = TRUE)
+    ] <- "Coal"
+    location_fuel[
+      grepl("gas", location_fuel_raw, ignore.case = TRUE)
+    ] <- "Gas"
+    location_fuel[
+      grepl("oil|petroleum|diesel", location_fuel_raw, ignore.case = TRUE)
+    ] <- "Oil"
+    location_fuel[
+      grepl("wood|biomass", location_fuel_raw, ignore.case = TRUE)
+    ] <- "Biomass"
+    location_fuel[
+      grepl("renew", location_fuel_raw, ignore.case = TRUE)
+    ] <- "Renewable"
+
+    location <- data.table(
+      Plant_ID = as.character(column_or_default(
+        location_raw,
+        c("PLANT_CODE", "Plant ID", "Plant.ID"),
+        required = TRUE,
+        label = "location-file Plant ID"
+      )),
+      convert_fuel = location_fuel,
+      Longitude_join = as.numeric(column_or_default(
+        location_raw,
+        c("X", "Longitude", "LONGITUDE"),
+        required = TRUE,
+        label = "location-file longitude"
+      )),
+      Latitude_join = as.numeric(column_or_default(
+        location_raw,
+        c("Y", "Latitude", "LATITUDE"),
+        required = TRUE,
+        label = "location-file latitude"
+      ))
+    )
+    location <- location[
+      ,
+      .(
+        Longitude_join = mean(Longitude_join, na.rm = TRUE),
+        Latitude_join = mean(Latitude_join, na.rm = TRUE)
+      ),
+      by = .(Plant_ID, convert_fuel)
+    ]
+    location[
+      !is.finite(Longitude_join),
+      Longitude_join := NA_real_
+    ]
+    location[
+      !is.finite(Latitude_join),
+      Latitude_join := NA_real_
+    ]
+
+    location_by_plant <- location[
+      ,
+      .(
+        Longitude_plant = mean(Longitude_join, na.rm = TRUE),
+        Latitude_plant = mean(Latitude_join, na.rm = TRUE)
+      ),
+      by = Plant_ID
+    ]
+    location_by_plant[
+      !is.finite(Longitude_plant),
+      Longitude_plant := NA_real_
+    ]
+    location_by_plant[
+      !is.finite(Latitude_plant),
+      Latitude_plant := NA_real_
+    ]
+
+    generators <- merge(
+      generators,
+      location,
+      by = c("Plant_ID", "convert_fuel"),
+      all.x = TRUE
+    )
+    generators <- merge(
+      generators,
+      location_by_plant,
+      by = "Plant_ID",
+      all.x = TRUE
+    )
+    generators[
+      is.na(Longitude) & !is.na(Longitude_join),
+      Longitude := Longitude_join
+    ]
+    generators[
+      is.na(Latitude) & !is.na(Latitude_join),
+      Latitude := Latitude_join
+    ]
+    generators[
+      is.na(Longitude) & !is.na(Longitude_plant),
+      Longitude := Longitude_plant
+    ]
+    generators[
+      is.na(Latitude) & !is.na(Latitude_plant),
+      Latitude := Latitude_plant
+    ]
+    generators[
+      ,
+      c(
+        "Longitude_join",
+        "Latitude_join",
+        "Longitude_plant",
+        "Latitude_plant"
+      ) := NULL
+    ]
+  }
+
+  generators
+}
+
+historical_generators <- read_historical_generators(
+  HISTORICAL_GENERATOR_FILE,
+  HISTORICAL_LOCATION_FILE
+)
+
+message(
+  "Historical generator rows after standardization: ",
+  nrow(historical_generators)
+)
+
+# ------------------------------------------------------------------------------
+# 7. MAP EIA PRIME MOVER TO AN AVAILABLE CAMPD UNIT-TYPE LEVEL
+# ------------------------------------------------------------------------------
+
+find_unit_level <- function(levels_available, patterns, fallback) {
+  for (pattern in patterns) {
+    hit <- grep(
+      pattern,
+      levels_available,
+      value = TRUE,
+      ignore.case = TRUE,
+      perl = TRUE
+    )
+    if (length(hit) > 0L) return(hit[1L])
+  }
+  fallback
+}
+
+modal_unit_type_by_fuel <- function(model_data) {
+  counts <- as.data.table(model_data)[
+    ,
+    .N,
+    by = .(
+      convert_fuel = as.character(convert_fuel),
+      Unit.Type = as.character(Unit.Type)
+    )
+  ]
+  setorder(counts, convert_fuel, -N, Unit.Type)
+  counts[, .SD[1L], by = convert_fuel]
+}
+
+historical_unit_mapping <- function(
+  prime_mover,
+  fuel,
+  levels_available,
+  model_data
+) {
+  modal_by_fuel <- modal_unit_type_by_fuel(model_data)
+  overall_counts <- as.data.table(model_data)[
+    ,
+    .N,
+    by = .(Unit.Type = as.character(Unit.Type))
+  ][order(-N, Unit.Type)]
+  overall_modal <- overall_counts$Unit.Type[1L]
+
+  combustion_level <- find_unit_level(
+    levels_available,
+    c("^Combustion turbine$", "combustion.?turbine", "gas.?turbine"),
+    overall_modal
+  )
+  combined_cycle_level <- find_unit_level(
+    levels_available,
+    c("combined.?cycle"),
+    combustion_level
+  )
+  internal_combustion_level <- find_unit_level(
+    levels_available,
+    c("internal.?combust", "reciprocat"),
+    overall_modal
+  )
+
+  code <- toupper(trimws(as.character(prime_mover)))
+  fuel <- as.character(fuel)
+  mapped <- rep(NA_character_, length(code))
+  method <- rep("fuel-specific modern modal unit type", length(code))
+
+  for (fuel_value in unique(fuel)) {
+    rows <- which(fuel == fuel_value)
+    modal_hit <- modal_by_fuel[
+      convert_fuel == fuel_value,
+      Unit.Type
+    ]
+    mapped[rows] <- if (length(modal_hit) > 0L) {
+      modal_hit[1L]
+    } else {
+      overall_modal
+    }
+  }
+
+  # ST identifies steam generation but not a CAMPD boiler firing design.
+  # Retain the fuel-specific modal imputation rather than inventing a subtype.
+  method[code %in% c("ST")] <- "ST; fuel-specific modern modal unit type"
+  mapped[code %in% c("GT")] <- combustion_level
+  method[code %in% c("GT")] <- "direct GT mapping"
+  mapped[code %in% c("CT")] <- combustion_level
+  method[code %in% c("CT")] <- "direct CT mapping"
+  mapped[code %in% c("CA", "CS", "CC")] <- combined_cycle_level
+  method[code %in% c("CA", "CS", "CC")] <- "direct combined-cycle mapping"
+  mapped[code %in% c("IC")] <- internal_combustion_level
+  method[code %in% c("IC")] <- "direct IC mapping"
+
+  combined_rows <- grepl("combined", code, ignore.case = TRUE)
+  mapped[combined_rows] <- combined_cycle_level
+  method[combined_rows] <- "technology-text combined-cycle mapping"
+
+  turbine_rows <- grepl(
+    "combustion|gas.?turbine",
+    code,
+    ignore.case = TRUE
+  ) & !combined_rows
+  mapped[turbine_rows] <- combustion_level
+  method[turbine_rows] <- "technology-text combustion-turbine mapping"
+
+  internal_rows <- grepl("internal|reciprocat", code, ignore.case = TRUE)
+  mapped[internal_rows] <- internal_combustion_level
+  method[internal_rows] <- "technology-text internal-combustion mapping"
+
+  data.table(Unit.Type = mapped, mapping_method = method)
+}
+
+# ------------------------------------------------------------------------------
+# 8. HISTORICAL PREDICTION
+# ------------------------------------------------------------------------------
+
+prepare_historical_base <- function(capacity_factor) {
+  common_fuels <- intersect(
+    so2_model_result$fuel_levels,
+    nox_model_result$fuel_levels
+  )
+  common_fuels <- intersect(
+    common_fuels,
+    c("Coal", "Gas", "Oil", "Biomass")
+  )
+
+  yearly <- vector("list", length(TARGET_YEARS))
+  names(yearly) <- as.character(TARGET_YEARS)
+
+  for (year in TARGET_YEARS) {
+    selected <- historical_generators[
+      Operating_Year <= year &
+        (is.na(Retirement_Year) | Retirement_Year > year) &
+        convert_fuel %in% common_fuels
+    ]
+
+    if (nrow(selected) == 0L) {
+      warning("No historical combustion generators found for ", year)
+      next
+    }
+
+    selected <- copy(selected)
+    selected[, Year := as.integer(year)]
+    selected[, capacity_factor := capacity_factor]
+    selected[
+      ,
+      annual_gen_kWh :=
+        max_capacity_MW * 1000 * 8760 * capacity_factor
+    ]
+    selected[, log_Gen_kWh := log10(annual_gen_kWh + 1)]
+    yearly[[as.character(year)]] <- selected
+  }
+
+  combined <- rbindlist(yearly, use.names = TRUE, fill = TRUE)
+  if (nrow(combined) == 0L) {
+    stop("Historical prediction table is empty.")
+  }
+  combined[, historical_row_id := .I]
+  combined
+}
+
+predict_historical_pollutant <- function(base, model_result) {
+  prediction_data <- copy(base)
+  prediction_data[, convert_fuel := factor(
+    convert_fuel,
+    levels = model_result$fuel_levels
+  )]
+  unit_mapping <- historical_unit_mapping(
+    prediction_data$Prime_Mover,
+    as.character(prediction_data$convert_fuel),
+    model_result$unit_levels,
+    model_result$data
+  )
+  prediction_data[, Unit.Type := unit_mapping$Unit.Type]
+  prediction_data[, unit_type_mapping_method := unit_mapping$mapping_method]
+  prediction_data[, Unit.Type := factor(
+    Unit.Type,
+    levels = model_result$unit_levels
+  )]
+
+  for (control_column in model_result$controls) {
+    prediction_data[, (control_column) := 0L]
+  }
+
+  raw_matrix <- stats::model.matrix(
+    model_result$formula,
+    data = prediction_data
+  )
+  prediction_matrix <- align_matrix(
+    raw_matrix,
+    model_result$design_columns
+  )
+
+  prediction_log <- predict(
+    model_result$full_model,
+    xgb.DMatrix(prediction_matrix)
+  )
+  prediction_ef <- pmax(0, 10^prediction_log - 1)
+
+  pollutant_label <- ifelse(
+    model_result$pollutant == "NOX",
+    "NOx",
+    "SO2"
+  )
+  result <- data.table(
+    historical_row_id = prediction_data$historical_row_id,
+    mapped_Unit_Type = as.character(prediction_data$Unit.Type),
+    unit_type_mapping_method = prediction_data$unit_type_mapping_method,
+    predicted_log10_EF = prediction_log,
+    predicted_EF_g_per_kWh = prediction_ef,
+    emissions_tons = (
+      prediction_ef * prediction_data$annual_gen_kWh
+    ) / GRAMS_PER_SHORT_TON
+  )
+  setnames(
+    result,
+    c(
+      "mapped_Unit_Type",
+      "unit_type_mapping_method",
+      "predicted_log10_EF",
+      "predicted_EF_g_per_kWh",
+      "emissions_tons"
+    ),
+    paste0(
+      c(
+        "mapped_Unit_Type_",
+        "unit_type_mapping_method_",
+        "predicted_log10_EF_",
+        "predicted_EF_g_per_kWh_",
+        "emissions_tons_"
+      ),
+      pollutant_label
+    )
+  )
+  result
+}
+
+run_historical_prediction <- function(capacity_factor) {
+  base <- prepare_historical_base(capacity_factor)
+  so2_prediction <- predict_historical_pollutant(
+    base,
+    so2_model_result
+  )
+  nox_prediction <- predict_historical_pollutant(
+    base,
+    nox_model_result
+  )
+
+  result <- merge(
+    base,
+    so2_prediction,
+    by = "historical_row_id",
+    all.x = TRUE
+  )
+  result <- merge(
+    result,
+    nox_prediction,
+    by = "historical_row_id",
+    all.x = TRUE
+  )
+  setorder(result, Year, Plant_ID, Generator_ID)
+  result
+}
+
+historical_generator_primary <- run_historical_prediction(
+  PRIMARY_CAPACITY_FACTOR
+)
+
+generator_output_columns <- c(
+  "Year",
+  "Plant_ID",
+  "Generator_ID",
+  "Plant_Name",
+  "Plant_State",
+  "County",
+  "Longitude",
+  "Latitude",
+  "Energy_Source_Code",
+  "convert_fuel",
+  "Prime_Mover",
+  "Prime_Mover_Source",
+  "mapped_Unit_Type_SO2",
+  "unit_type_mapping_method_SO2",
+  "mapped_Unit_Type_NOx",
+  "unit_type_mapping_method_NOx",
+  "Operating_Year",
+  "Retirement_Year",
+  "max_capacity_MW",
+  "capacity_factor",
+  "annual_gen_kWh",
+  "predicted_EF_g_per_kWh_SO2",
+  "emissions_tons_SO2",
+  "predicted_EF_g_per_kWh_NOx",
+  "emissions_tons_NOx"
+)
+generator_output_columns <- intersect(
+  generator_output_columns,
+  names(historical_generator_primary)
+)
+
+fwrite(
+  historical_generator_primary[, ..generator_output_columns],
+  file.path(
+    OUT_DIR,
+    "historical_generator_emissions_1940_1990_CF095.csv"
+  )
+)
+
+historical_unit_mapping_qa <- rbindlist(
+  list(
+    historical_generator_primary[
+      ,
+      .N,
+      by = .(
+        Prime_Mover_Source,
+        Prime_Mover,
+        convert_fuel,
+        mapped_Unit_Type = mapped_Unit_Type_SO2,
+        mapping_method = unit_type_mapping_method_SO2
+      )
+    ][, pollutant := "SO2"],
+    
+    historical_generator_primary[
+      ,
+      .N,
+      by = .(
+        Prime_Mover_Source,
+        Prime_Mover,
+        convert_fuel,
+        mapped_Unit_Type = mapped_Unit_Type_NOx,
+        mapping_method = unit_type_mapping_method_NOx
+      )
+    ][, pollutant := "NOx"]
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+setorder(
+  historical_unit_mapping_qa,
+  pollutant,
+  -N,
+  Prime_Mover_Source,
+  Prime_Mover
+)
+fwrite(
+  historical_unit_mapping_qa,
+  file.path(OUT_DIR, "historical_unit_type_mapping_QA.csv")
+)
+
+# ------------------------------------------------------------------------------
+# 9. TRUE FACILITY-LEVEL AGGREGATION
+# ------------------------------------------------------------------------------
+
+dominant_fuel <- historical_generator_primary[
+  ,
+  .(fuel_capacity_MW = sum(max_capacity_MW, na.rm = TRUE)),
+  by = .(Year, Plant_ID, convert_fuel)
+][
+  order(Year, Plant_ID, -fuel_capacity_MW, convert_fuel)
+][
+  ,
+  .SD[1L],
+  by = .(Year, Plant_ID)
+][
+  ,
+  .(Year, Plant_ID, dominant_fuel = convert_fuel)
+]
+
+historical_facility_primary <- historical_generator_primary[
+  ,
+  .(
+    Plant_Name = first_nonmissing(Plant_Name),
+    Plant_State = first_nonmissing(Plant_State),
+    County = first_nonmissing(County),
+    Longitude = weighted_mean_available(Longitude, max_capacity_MW),
+    Latitude = weighted_mean_available(Latitude, max_capacity_MW),
+    n_generators = .N,
+    total_capacity_MW = sum(max_capacity_MW, na.rm = TRUE),
+    annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
+    SO2_tons = sum(emissions_tons_SO2, na.rm = TRUE),
+    NOx_tons = sum(emissions_tons_NOx, na.rm = TRUE),
+    SO2_EF_generation_weighted_g_per_kWh = stats::weighted.mean(
+      predicted_EF_g_per_kWh_SO2,
+      annual_gen_kWh,
+      na.rm = TRUE
+    ),
+    NOx_EF_generation_weighted_g_per_kWh = stats::weighted.mean(
+      predicted_EF_g_per_kWh_NOx,
+      annual_gen_kWh,
+      na.rm = TRUE
+    )
+  ),
+  by = .(Year, Plant_ID, capacity_factor)
+]
+
+historical_facility_primary <- merge(
+  historical_facility_primary,
+  dominant_fuel,
+  by = c("Year", "Plant_ID"),
+  all.x = TRUE
+)
+setorder(historical_facility_primary, Year, Plant_ID)
+
+fwrite(
+  historical_facility_primary,
+  file.path(
+    OUT_DIR,
+    "historical_facility_emissions_1940_1990_CF095.csv"
+  )
+)
+
+year_fuel_summary <- historical_generator_primary[
+  ,
+  .(
+    generators = .N,
+    capacity_MW = sum(max_capacity_MW, na.rm = TRUE),
+    annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
+    SO2_tons = sum(emissions_tons_SO2, na.rm = TRUE),
+    NOx_tons = sum(emissions_tons_NOx, na.rm = TRUE)
+  ),
+  by = .(Year, convert_fuel, capacity_factor)
+][order(Year, convert_fuel)]
+
+year_total_summary <- historical_generator_primary[
+  ,
+  .(
+    generators = .N,
+    facilities = uniqueN(Plant_ID),
+    capacity_MW = sum(max_capacity_MW, na.rm = TRUE),
+    annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
+    SO2_tons = sum(emissions_tons_SO2, na.rm = TRUE),
+    NOx_tons = sum(emissions_tons_NOx, na.rm = TRUE)
+  ),
+  by = .(Year, capacity_factor)
+][order(Year)]
+
+fwrite(
+  year_fuel_summary,
+  file.path(OUT_DIR, "historical_year_fuel_summary_CF095.csv")
+)
+fwrite(
+  year_total_summary,
+  file.path(OUT_DIR, "historical_year_total_summary_CF095.csv")
+)
+
+# ------------------------------------------------------------------------------
+# 10. LOW-COST CAPACITY-FACTOR SENSITIVITY
+# ------------------------------------------------------------------------------
+
+capacity_factor_sensitivity <- list(year_total_summary)
+
+if (length(SENSITIVITY_CAPACITY_FACTORS) > 0L) {
+  for (capacity_factor in SENSITIVITY_CAPACITY_FACTORS) {
+    message(
+      "Running historical capacity-factor sensitivity: CF = ",
+      capacity_factor
+    )
+    sensitivity_generator <- run_historical_prediction(capacity_factor)
+    sensitivity_total <- sensitivity_generator[
+      ,
+      .(
+        generators = .N,
+        facilities = uniqueN(Plant_ID),
+        capacity_MW = sum(max_capacity_MW, na.rm = TRUE),
+        annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
+        SO2_tons = sum(emissions_tons_SO2, na.rm = TRUE),
+        NOx_tons = sum(emissions_tons_NOx, na.rm = TRUE)
+      ),
+      by = .(Year, capacity_factor)
+    ][order(Year)]
+    capacity_factor_sensitivity[[
+      length(capacity_factor_sensitivity) + 1L
+    ]] <- sensitivity_total
+    rm(sensitivity_generator)
+    invisible(gc())
+  }
+}
+
+capacity_factor_sensitivity <- rbindlist(
+  capacity_factor_sensitivity,
+  use.names = TRUE,
+  fill = TRUE
+)
+setorder(capacity_factor_sensitivity, Year, capacity_factor)
+fwrite(
+  capacity_factor_sensitivity,
+  file.path(
+    OUT_DIR,
+    "historical_capacity_factor_sensitivity_year_totals.csv"
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 11. READY-TO-COPY TABLE S4 AND RESULTS SENTENCE
+# ------------------------------------------------------------------------------
+
+so2_result <- model_results[pollutant == "SO2"]
+nox_result <- model_results[pollutant == "NOx"]
+
+settings_text <- function(result_row) {
+  sprintf(
+    paste0(
+      "max_depth = %d; eta = %.3f; min_child_weight = %.1f; ",
+      "gamma = %.1f; subsample = %.2f; colsample_bytree = %.2f; ",
+      "lambda = %.1f; alpha = %.1f; boosting rounds = %d"
+    ),
+    result_row$max_depth,
+    result_row$eta,
+    result_row$min_child_weight,
+    result_row$gamma,
+    result_row$subsample,
+    result_row$colsample_bytree,
+    result_row$lambda,
+    result_row$alpha,
+    result_row$selected_boosting_rounds
+  )
+}
+
+performance_text <- function(result_row) {
+  sprintf(
+    paste0(
+      "MAE = %.4f g kWh^-1; RMSE = %.4f g kWh^-1; ",
+      "predictive R2 = %.3f; mean bias = %.4f g kWh^-1"
+    ),
+    result_row$MAE_g_per_kWh,
+    result_row$RMSE_g_per_kWh,
+    result_row$predictive_R2,
+    result_row$mean_bias_g_per_kWh
+  )
+}
+
+table_s4_ready <- data.table(
+  Component = c(
+    "Modern calibration data",
+    "Emission-factor response",
+    "Predictors",
+    "Model development and validation",
+    "SO2 selected model settings",
+    "NOx selected model settings",
+    "Independent holdout performance",
+    "Historical analysis years",
+    "Operating-unit definition",
+    "Historical generation",
+    "Historical fuel and unit type",
+    "Historical emission controls",
+    "Historical emissions output"
+  ),
+  Specification = c(
+    paste0(
+      "CAMPD unit-year records for 1995-2020 with nonnegative ",
+      "SO2 or NOx mass emissions, positive gross generation and ",
+      "emission factors below ", MAX_EF_G_PER_KWH, " g kWh^-1."
+    ),
+    paste0(
+      "Separate SO2 and NOx models used log10(EF + 1). ",
+      "Predictions were returned to g kWh^-1 as 10^z - 1."
+    ),
+    paste0(
+      "Primary fuel, unit type, calendar year, log10-transformed ",
+      "gross generation and pollutant-specific controls retained only ",
+      "when at least one positive record was present. SO2: ",
+      paste(so2_model_result$controls, collapse = ", "),
+      ". NOx: ",
+      paste(nox_model_result$controls, collapse = ", "),
+      "."
+    ),
+    sprintf(
+      paste0(
+        "Facilities were assigned to development (SO2: %d facilities, ",
+        "%d records; NOx: %d facilities, %d records) or independent ",
+        "holdout sets (SO2: %d facilities, %d records; NOx: %d ",
+        "facilities, %d records). Four prespecified parameter ",
+        "configurations were compared by five-fold facility-grouped ",
+        "cross-validation within the development set; early stopping ",
+        "used %d rounds. Holdout facilities were used only once for ",
+        "final evaluation."
+      ),
+      so2_result$development_facilities,
+      so2_result$development_records,
+      nox_result$development_facilities,
+      nox_result$development_records,
+      so2_result$holdout_facilities,
+      so2_result$holdout_records,
+      nox_result$holdout_facilities,
+      nox_result$holdout_records,
+      EARLY_STOPPING_PATIENCE
+    ),
+    settings_text(so2_result),
+    settings_text(nox_result),
+    paste0(
+      "SO2: ", performance_text(so2_result),
+      ". NOx: ", performance_text(nox_result), "."
+    ),
+    paste(TARGET_YEARS, collapse = ", "),
+    paste0(
+      "Operating year <= target year and retirement year > target ",
+      "year or unavailable."
+    ),
+    paste0(
+      "Nameplate capacity x 1,000 x 8,760 x ",
+      format(PRIMARY_CAPACITY_FACTOR, nsmall = 2),
+      ". The uniform capacity factor was treated as a high-utilization ",
+      "assumption; CF = 0.50 was evaluated separately."
+    ),
+    paste0(
+      "EIA energy-source codes were grouped as coal, gas, oil, biomass, ",
+      "renewable or unknown. Unambiguous EIA prime-mover codes and ",
+      "technology descriptions were mapped directly to compatible CAMPD ",
+      "unit types. Where the source identified only a broad steam or fuel ",
+      "technology and not a CAMPD boiler subtype, unit type was imputed as ",
+      "the most frequent modern CAMPD unit type within that fuel category; ",
+      "the mapping method was retained in the generator-level audit output."
+    ),
+    "All historical pollutant-specific control indicators were set to zero.",
+    paste0(
+      "Predicted emission factors were multiplied by estimated ",
+      "generation, converted using ", GRAMS_PER_SHORT_TON,
+      " g per short ton and summed by Plant ID."
+    )
+  )
+)
+
+fwrite(
+  table_s4_ready,
+  file.path(OUT_DIR, "TableS4_ready_to_copy.csv"),
+  quote = TRUE
+)
+
+results_sentence <- sprintf(
+  paste0(
+    "On the independent facility-level holdout set, the SO2 model ",
+    "achieved an MAE of %.4f g kWh^-1, an RMSE of %.4f g kWh^-1, ",
+    "a predictive R2 of %.3f and a mean bias of %.4f g kWh^-1. ",
+    "Corresponding values for the NOx model were %.4f g kWh^-1, ",
+    "%.4f g kWh^-1, %.3f and %.4f g kWh^-1, respectively (Table S4)."
+  ),
+  so2_result$MAE_g_per_kWh,
+  so2_result$RMSE_g_per_kWh,
+  so2_result$predictive_R2,
+  so2_result$mean_bias_g_per_kWh,
+  nox_result$MAE_g_per_kWh,
+  nox_result$RMSE_g_per_kWh,
+  nox_result$predictive_R2,
+  nox_result$mean_bias_g_per_kWh
+)
+
+writeLines(
+  results_sentence,
+  file.path(OUT_DIR, "TableS4_results_sentence.txt")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUT_DIR, "R_sessionInfo.txt")
+)
+
+main_output_names <- c(
+  "TableS4_model_results.csv",
+  "TableS4_ready_to_copy.csv",
+  "TableS4_results_sentence.txt",
+  "TableS4_holdout_predictions.csv",
+  "TableS4_grouped_CV_summary.csv",
+  "historical_generator_emissions_1940_1990_CF095.csv",
+  "historical_facility_emissions_1940_1990_CF095.csv",
+  "historical_year_fuel_summary_CF095.csv",
+  "historical_year_total_summary_CF095.csv",
+  "historical_capacity_factor_sensitivity_year_totals.csv"
+)
+main_output_paths <- file.path(OUT_DIR, main_output_names)
+missing_outputs <- main_output_names[!file.exists(main_output_paths)]
+if (length(missing_outputs) > 0L) {
+  stop(
+    "Run did not finish; required output file(s) are missing:\n  ",
+    paste(missing_outputs, collapse = "\n  ")
+  )
+}
+
+output_mtimes <- file.info(main_output_paths)$mtime
+stale_outputs <- main_output_names[
+  is.na(output_mtimes) | output_mtimes < RUN_STARTED_AT
+]
+if (length(stale_outputs) > 0L) {
+  stop(
+    "Run did not finish; output file(s) were not regenerated in this run:\n  ",
+    paste(stale_outputs, collapse = "\n  ")
+  )
+}
+
+completion_text <- c(
+  "TABLE S4 MODEL REBUILD COMPLETED",
+  paste("Completed:", Sys.time()),
+  paste("Output directory:", normalizePath(OUT_DIR, mustWork = FALSE)),
+  "",
+  "Main files:",
+  paste0("  ", main_output_names)
+)
+writeLines(
+  completion_text,
+  file.path(OUT_DIR, "RUN_COMPLETE.txt")
+)
+
+message("\n", paste(completion_text, collapse = "\n"))
+message("\nReady-to-use Results sentence:\n", results_sentence)
