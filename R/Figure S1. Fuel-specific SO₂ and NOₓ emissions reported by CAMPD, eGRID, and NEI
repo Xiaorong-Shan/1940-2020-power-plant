@@ -1,8 +1,16 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Figure S1: full data preparation and publication plot
+# Figure S1: full data preparation and inventory-agreement scatterplot
 # Fuel-specific SO2 and NOx emissions from CAMPD, eGRID, and NEI
+#
+# This script:
+#   1. reads the original CAMPD, eGRID, and NEI files;
+#   2. automatically identifies the eGRID plant-table header;
+#   3. maps both written fuel names and historical eGRID fuel codes;
+#   4. aligns inventories only at identical years;
+#   5. draws the six-panel CAMPD-reference scatterplot; and
+#   6. saves the figure and processed files in the original project folders.
 # ================================================================
 
 rm(list = ls(all.names = TRUE))
@@ -14,7 +22,6 @@ suppressPackageStartupMessages({
   library(tidyr)
   library(stringr)
   library(readr)
-  library(janitor)
   library(ggplot2)
   library(scales)
 })
@@ -23,7 +30,9 @@ suppressPackageStartupMessages({
 # 0. Locate the local project
 # ------------------------------
 
-candidate_project_roots <- c(
+candidate_project_roots <- unique(c(
+  getwd(),
+  "/scratch/xshan2/R_Code/disperseR/main",
   paste0(
     "/Users/xshan2/Library/CloudStorage/",
     "OneDrive-GeorgeMasonUniversity-O365Production/",
@@ -37,27 +46,55 @@ candidate_project_roots <- c(
     "C:/Users/xshan2/OneDrive - George Mason University - O365 Production/",
     "GMU_PhD/01_Research/03_powerplant"
   )
-)
+))
 
-existing_roots <- candidate_project_roots[dir.exists(candidate_project_roots)]
+existing_roots <- candidate_project_roots[
+  dir.exists(file.path(candidate_project_roots, "data"))
+]
 if (length(existing_roots) == 0) {
-  stop("Cannot locate the local 03_powerplant project directory.")
+  stop(
+    "Cannot locate the project data directory. Expected a data/ folder under:\n",
+    paste(candidate_project_roots, collapse = "\n")
+  )
 }
 
 PROJECT_ROOT <- existing_roots[1]
 DATA_ROOT <- file.path(PROJECT_ROOT, "data")
+
+# Preserve the project's established output structure.
 OUTPUT_DIR <- file.path(PROJECT_ROOT, "Figure_plot")
 PROCESSED_DIR <- file.path(DATA_ROOT, "processed_modern_emissions")
 
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(PROCESSED_DIR, recursive = TRUE, showWarnings = FALSE)
 
+if (!dir.exists(OUTPUT_DIR) || !dir.exists(PROCESSED_DIR)) {
+  stop(
+    "Could not create the project output directories:\n",
+    OUTPUT_DIR, "\n",
+    PROCESSED_DIR
+  )
+}
+
 message("Project root: ", PROJECT_ROOT)
 message("Data root: ", DATA_ROOT)
+message("Figure output directory: ", OUTPUT_DIR)
+message("Processed-data directory: ", PROCESSED_DIR)
 
 # ------------------------------
 # 1. General helpers
 # ------------------------------
+
+clean_names_simple <- function(data) {
+  cleaned <- iconv(names(data), to = "ASCII//TRANSLIT")
+  cleaned[is.na(cleaned)] <- names(data)[is.na(cleaned)]
+  cleaned <- tolower(cleaned)
+  cleaned <- gsub("[^a-z0-9]+", "_", cleaned)
+  cleaned <- gsub("^_+|_+$", "", cleaned)
+  cleaned[cleaned == ""] <- "x"
+  names(data) <- make.unique(cleaned, sep = "_")
+  data
+}
 
 to_numeric_clean <- function(x) {
   x <- trimws(as.character(x))
@@ -78,18 +115,170 @@ first_matching_column <- function(column_names, patterns, required = TRUE) {
 }
 
 map_fuel_group <- function(x) {
-  lower <- tolower(as.character(x))
+  raw <- trimws(as.character(x))
+  lower <- tolower(raw)
+  code <- toupper(gsub("[^A-Z0-9]", "", raw))
+
+  coal_codes <- c(
+    "ANT", "BIT", "LIG", "SUB", "WC", "RC", "SC", "COL", "COAL"
+  )
+  gas_codes <- c(
+    "NG", "BFG", "COG", "OG", "PG", "SG", "SNG", "GAS"
+  )
+  oil_codes <- c(
+    "DFO", "RFO", "JF", "KER", "WO", "PC", "PET", "OIL"
+  )
+  biomass_codes <- c(
+    "AB", "BLQ", "LFG", "MSW", "OBG", "OBS", "WDL", "WDS", "BIO"
+  )
+
   case_when(
-    str_detect(lower, "coal|bituminous|subbituminous|lignite") ~ "Coal",
-    str_detect(lower, "natural gas|gas|gaseous") ~ "Gas",
-    str_detect(lower, "oil|petroleum|diesel|distillate|residual") ~ "Oil",
-    str_detect(lower, "biomass|wood|waste|landfill") ~ "Biomass",
+    code %in% coal_codes |
+      str_detect(
+        lower,
+        "coal|anthracite|bituminous|subbituminous|lignite|coal refuse"
+      ) ~ "Coal",
+    code %in% gas_codes |
+      str_detect(
+        lower,
+        "natural gas|blast furnace gas|coke oven gas|gaseous"
+      ) ~ "Gas",
+    code %in% oil_codes |
+      str_detect(code, "^FO[0-9]+$") |
+      str_detect(
+        lower,
+        "oil|petroleum|diesel|distillate|residual|kerosene|jet fuel"
+      ) ~ "Oil",
+    code %in% biomass_codes |
+      str_detect(
+        lower,
+        "biomass|wood|black liquor|landfill gas|municipal solid waste"
+      ) ~ "Biomass",
     TRUE ~ "Other"
   )
 }
 
 ST_TO_METRIC <- 0.907185
 LB_TO_METRIC_TON <- 0.00045359237
+
+# ------------------------------
+# Safe output helpers
+# ------------------------------
+
+# OneDrive CloudStorage can time out when R writes compressed or high-resolution
+# files directly into the synced project folder. All outputs are therefore
+# completed in this temporary staging folder first. They are copied to the
+# original project folders only after the data preparation and plotting finish.
+# The staging folder is not the final output location.
+STAGE_ROOT <- file.path(path.expand("~"), "powerplant_s1_write_stage")
+dir.create(STAGE_ROOT, recursive = TRUE, showWarnings = FALSE)
+
+if (!dir.exists(STAGE_ROOT)) {
+  stop("Could not create the local write-staging directory: ", STAGE_ROOT)
+}
+
+PUBLISH_QUEUE <- list()
+
+staged_path <- function(final_path) {
+  stage_dir <- file.path(STAGE_ROOT, basename(dirname(final_path)))
+  dir.create(stage_dir, recursive = TRUE, showWarnings = FALSE)
+  file.path(stage_dir, basename(final_path))
+}
+
+register_output <- function(stage_path, final_path) {
+  PUBLISH_QUEUE[[length(PUBLISH_QUEUE) + 1L]] <<- list(
+    stage_path = stage_path,
+    final_path = final_path
+  )
+  invisible(stage_path)
+}
+
+stage_write_csv <- function(data, final_path) {
+  stage_path <- staged_path(final_path)
+  readr::write_csv(data, stage_path)
+  register_output(stage_path, final_path)
+}
+
+stage_save_rds <- function(object, final_path) {
+  stage_path <- staged_path(final_path)
+  saveRDS(object, stage_path)
+  register_output(stage_path, final_path)
+}
+
+stage_ggsave <- function(final_path, plot, ...) {
+  stage_path <- staged_path(final_path)
+  ggplot2::ggsave(
+    filename = stage_path,
+    plot = plot,
+    ...
+  )
+  register_output(stage_path, final_path)
+}
+
+same_file_size <- function(first_path, second_path) {
+  tryCatch({
+    if (!file.exists(first_path) || !file.exists(second_path)) return(FALSE)
+
+    first_size <- file.info(first_path)$size
+    second_size <- file.info(second_path)$size
+
+    is.finite(first_size) &&
+      is.finite(second_size) &&
+      first_size > 0 &&
+      identical(as.numeric(first_size), as.numeric(second_size))
+  }, error = function(e) FALSE)
+}
+
+publish_project_outputs <- function(queue, retries = 2L, wait_seconds = 3) {
+  results <- vector("list", length(queue))
+
+  for (i in seq_along(queue)) {
+    stage_path <- queue[[i]]$stage_path
+    final_path <- queue[[i]]$final_path
+    dir.create(dirname(final_path), recursive = TRUE, showWarnings = FALSE)
+
+    copied <- FALSE
+    for (attempt in seq_len(retries)) {
+      copied_now <- tryCatch(
+        suppressWarnings(
+          file.copy(
+            from = stage_path,
+            to = final_path,
+            overwrite = TRUE,
+            copy.mode = FALSE,
+            copy.date = FALSE
+          )
+        ),
+        error = function(e) FALSE
+      )
+
+      copied <- isTRUE(copied_now) && same_file_size(stage_path, final_path)
+      if (copied) break
+      if (attempt < retries) Sys.sleep(wait_seconds)
+    }
+
+    results[[i]] <- tibble(
+      stage_path = stage_path,
+      final_path = final_path,
+      copied = copied
+    )
+
+    if (copied) {
+      unlink(stage_path)
+    } else {
+      warning(
+        "OneDrive did not accept this file after ", retries,
+        " attempts. The completed local copy was retained at:\n",
+        stage_path,
+        "\nIntended project path:\n",
+        final_path,
+        call. = FALSE
+      )
+    }
+  }
+
+  bind_rows(results)
+}
 
 # ================================================================
 # 2. CAMPD: 1980–2020 unit-level annual emissions
@@ -154,7 +343,7 @@ campd_raw <- readr::read_csv(
   show_col_types = FALSE,
   guess_max = 300000
 ) %>%
-  janitor::clean_names()
+  clean_names_simple()
 
 campd_names <- names(campd_raw)
 campd_year_col <- first_matching_column(campd_names, c("^year$"))
@@ -214,8 +403,14 @@ campd_year_total <- campd_year_fuel %>%
   ) %>%
   mutate(dataset = "CAMPD")
 
-write_csv(campd_year_fuel, file.path(PROCESSED_DIR, "campd_by_year_fuel.csv"))
-write_csv(campd_year_total, file.path(PROCESSED_DIR, "campd_by_year_total.csv"))
+stage_write_csv(
+  campd_year_fuel,
+  file.path(PROCESSED_DIR, "campd_by_year_fuel.csv")
+)
+stage_write_csv(
+  campd_year_total,
+  file.path(PROCESSED_DIR, "campd_by_year_total.csv")
+)
 
 message("CAMPD year-fuel rows: ", nrow(campd_year_fuel))
 
@@ -295,14 +490,17 @@ read_egrid_file <- function(base_name) {
 
   for (skip_value in skip_candidates) {
     attempt <- tryCatch(
-      read_excel(
-        path,
-        sheet = rule$sheet,
-        skip = skip_value,
-        col_types = "text",
-        guess_max = 100000
+      suppressMessages(
+        read_excel(
+          path,
+          sheet = rule$sheet,
+          skip = skip_value,
+          col_types = "text",
+          guess_max = 100000,
+          .name_repair = "minimal"
+        )
       ) %>%
-        clean_names(),
+        clean_names_simple(),
       error = function(e) NULL
     )
 
@@ -359,6 +557,47 @@ read_egrid_file <- function(base_name) {
 egrid_raw <- bind_rows(lapply(egrid_target_bases, read_egrid_file))
 if (nrow(egrid_raw) == 0) stop("No eGRID files were successfully read.")
 
+expected_egrid_years <- as.integer(
+  str_extract(egrid_target_bases, "\\d{4}")
+)
+read_egrid_years <- sort(unique(egrid_raw$year))
+missing_egrid_years <- setdiff(expected_egrid_years, read_egrid_years)
+
+if (length(missing_egrid_years) > 0) {
+  stop(
+    "The following required eGRID years were not read successfully: ",
+    paste(missing_egrid_years, collapse = ", ")
+  )
+}
+
+egrid_fuel_code_qa <- egrid_raw %>%
+  mutate(
+    primary_fuel = trimws(as.character(primary_fuel)),
+    fuel_group = map_fuel_group(primary_fuel)
+  ) %>%
+  count(year, primary_fuel, fuel_group, name = "n_plants") %>%
+  arrange(year, fuel_group, desc(n_plants), primary_fuel)
+
+stage_write_csv(
+  egrid_fuel_code_qa,
+  file.path(PROCESSED_DIR, "egrid_fuel_code_QA.csv")
+)
+
+unmapped_egrid_codes <- egrid_fuel_code_qa %>%
+  filter(
+    fuel_group == "Other",
+    !is.na(primary_fuel),
+    primary_fuel != ""
+  )
+
+if (nrow(unmapped_egrid_codes) > 0) {
+  message(
+    "Unmapped eGRID codes were retained only in the QA file and excluded ",
+    "from the Coal/Gas/Oil comparison: ",
+    paste(sort(unique(unmapped_egrid_codes$primary_fuel)), collapse = ", ")
+  )
+}
+
 egrid_standard <- egrid_raw %>%
   mutate(fuel_group = map_fuel_group(primary_fuel)) %>%
   filter(fuel_group %in% c("Coal", "Gas", "Oil"))
@@ -373,13 +612,30 @@ egrid_by_year_fuel <- egrid_standard %>%
       sum(hg_lbs, na.rm = TRUE) * LB_TO_METRIC_TON / 1e6,
     .groups = "drop"
   ) %>%
-  complete(
-    year,
-    fuel_group = c("Coal", "Gas", "Oil"),
-    fill = list(so2_Mt = 0, nox_Mt = 0, co2_Gt = 0)
-  ) %>%
   arrange(year, fuel_group) %>%
   mutate(dataset = "eGRID")
+
+expected_egrid_groups <- tidyr::expand_grid(
+  year = sort(unique(egrid_raw$year)),
+  fuel_group = c("Coal", "Gas", "Oil")
+)
+
+missing_egrid_groups <- expected_egrid_groups %>%
+  anti_join(
+    egrid_by_year_fuel %>% select(year, fuel_group),
+    by = c("year", "fuel_group")
+  )
+
+if (nrow(missing_egrid_groups) > 0) {
+  stop(
+    "At least one required eGRID year-fuel group was not mapped. ",
+    "Review egrid_fuel_code_QA.csv. Missing combinations:\n",
+    paste(
+      paste(missing_egrid_groups$year, missing_egrid_groups$fuel_group),
+      collapse = "\n"
+    )
+  )
+}
 
 egrid_by_year_total <- egrid_by_year_fuel %>%
   group_by(year) %>%
@@ -392,8 +648,14 @@ egrid_by_year_total <- egrid_by_year_fuel %>%
   ) %>%
   mutate(dataset = "eGRID")
 
-write_csv(egrid_by_year_fuel, file.path(PROCESSED_DIR, "egrid_by_year_fuel.csv"))
-write_csv(egrid_by_year_total, file.path(PROCESSED_DIR, "egrid_by_year_total.csv"))
+stage_write_csv(
+  egrid_by_year_fuel,
+  file.path(PROCESSED_DIR, "egrid_by_year_fuel.csv")
+)
+stage_write_csv(
+  egrid_by_year_total,
+  file.path(PROCESSED_DIR, "egrid_by_year_total.csv")
+)
 
 message("eGRID year-fuel rows: ", nrow(egrid_by_year_fuel))
 
@@ -433,7 +695,7 @@ nei_raw <- read_excel(
   sheet = national_sheet[1],
   guess_max = 300000
 ) %>%
-  clean_names()
+  clean_names_simple()
 
 nei_names <- names(nei_raw)
 nei_tier_col <- first_matching_column(
@@ -490,12 +752,6 @@ nei_nat_egu_by_year_fuel_pollutant <- nei_standard %>%
     emissions_Mt = sum(emissions_short_tons, na.rm = TRUE) * ST_TO_METRIC / 1e6,
     .groups = "drop"
   ) %>%
-  complete(
-    year,
-    fuel_group = c("Coal", "Gas", "Oil", "Biomass", "Other"),
-    pollutant,
-    fill = list(emissions_Mt = 0)
-  ) %>%
   arrange(year, fuel_group, pollutant) %>%
   mutate(dataset = "NEI") %>%
   select(year, fuel_group, pollutant, dataset, emissions_Mt)
@@ -509,11 +765,11 @@ nei_nat_egu_by_year_total_pollutant <- nei_nat_egu_by_year_fuel_pollutant %>%
   mutate(dataset = "NEI") %>%
   select(year, pollutant, dataset, emissions_Mt)
 
-write_csv(
+stage_write_csv(
   nei_nat_egu_by_year_fuel_pollutant,
   file.path(PROCESSED_DIR, "nei_by_year_fuel_pollutant.csv")
 )
-write_csv(
+stage_write_csv(
   nei_nat_egu_by_year_total_pollutant,
   file.path(PROCESSED_DIR, "nei_by_year_total_pollutant.csv")
 )
@@ -524,21 +780,33 @@ message("NEI year-fuel-pollutant rows: ", nrow(nei_nat_egu_by_year_fuel_pollutan
 # 5. Save all reusable upstream objects
 # ================================================================
 
-saveRDS(campd_year_fuel, file.path(PROCESSED_DIR, "campd_year_fuel.rds"))
-saveRDS(campd_year_total, file.path(PROCESSED_DIR, "campd_year_total.rds"))
-saveRDS(egrid_by_year_fuel, file.path(PROCESSED_DIR, "egrid_by_year_fuel.rds"))
-saveRDS(egrid_by_year_total, file.path(PROCESSED_DIR, "egrid_by_year_total.rds"))
-saveRDS(
+stage_save_rds(
+  campd_year_fuel,
+  file.path(PROCESSED_DIR, "campd_year_fuel.rds")
+)
+stage_save_rds(
+  campd_year_total,
+  file.path(PROCESSED_DIR, "campd_year_total.rds")
+)
+stage_save_rds(
+  egrid_by_year_fuel,
+  file.path(PROCESSED_DIR, "egrid_by_year_fuel.rds")
+)
+stage_save_rds(
+  egrid_by_year_total,
+  file.path(PROCESSED_DIR, "egrid_by_year_total.rds")
+)
+stage_save_rds(
   nei_nat_egu_by_year_fuel_pollutant,
   file.path(PROCESSED_DIR, "nei_nat_egu_by_year_fuel_pollutant.rds")
 )
-saveRDS(
+stage_save_rds(
   nei_nat_egu_by_year_total_pollutant,
   file.path(PROCESSED_DIR, "nei_nat_egu_by_year_total_pollutant.rds")
 )
 
 # ================================================================
-# 6. Assemble Figure S1 plotting data
+# 6. Align the inventories at overlapping years
 # ================================================================
 
 s1_nei_long <- nei_nat_egu_by_year_fuel_pollutant %>%
@@ -579,118 +847,381 @@ s1_campd_long <- campd_year_fuel %>%
     values_to = "value_Mt"
   )
 
-s1_plot_data <- bind_rows(s1_nei_long, s1_egrid_long, s1_campd_long) %>%
+s1_plot_data <- bind_rows(
+  s1_campd_long,
+  s1_egrid_long,
+  s1_nei_long
+) %>%
   filter(
     fuel_group %in% c("Coal", "Gas", "Oil"),
     pollutant %in% c("SO2", "NOX"),
     is.finite(value_Mt),
     value_Mt >= 0
   ) %>%
-  mutate(
-    dataset = factor(dataset, levels = c("CAMPD", "eGRID", "NEI")),
-    fuel_group = factor(fuel_group, levels = c("Coal", "Gas", "Oil")),
-    pollutant = recode(pollutant, "NOX" = "NO[x]", "SO2" = "SO[2]"),
-    pollutant = factor(pollutant, levels = c("NO[x]", "SO[2]"))
-  ) %>%
-  arrange(dataset, pollutant, fuel_group, year)
+  group_by(year, dataset, fuel_group, pollutant) %>%
+  summarise(value_Mt = sum(value_Mt, na.rm = TRUE), .groups = "drop")
 
-write_csv(s1_plot_data, file.path(PROCESSED_DIR, "Figure_S1_plot_data.csv"))
-
-# ================================================================
-# 7. Draw Figure S1
-# ================================================================
-
-s1_colors <- c("CAMPD" = "#E69F00", "eGRID" = "#0072B2", "NEI" = "#009E73")
-s1_linetypes <- c("CAMPD" = "solid", "eGRID" = "dashed", "NEI" = "dotdash")
-s1_shapes <- c("CAMPD" = 16, "eGRID" = 15, "NEI" = 17)
-s1_year_breaks <- seq(
-  floor(min(s1_plot_data$year) / 10) * 10,
-  ceiling(max(s1_plot_data$year) / 10) * 10,
-  by = 10
+stage_write_csv(
+  s1_plot_data,
+  file.path(PROCESSED_DIR, "Figure_S1_plot_data.csv")
 )
 
+s1_wide <- s1_plot_data %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = value_Mt
+  )
+
+# CAMPD is used as the common reference. Only identical years, fuels, and
+# pollutants are compared; no interpolation is used.
+s1_comparison <- bind_rows(
+  s1_wide %>%
+    filter(is.finite(CAMPD), is.finite(eGRID)) %>%
+    transmute(
+      year,
+      fuel_group,
+      pollutant,
+      comparison = "eGRID",
+      campd_Mt = CAMPD,
+      comparison_Mt = eGRID
+    ),
+  s1_wide %>%
+    filter(is.finite(CAMPD), is.finite(NEI)) %>%
+    transmute(
+      year,
+      fuel_group,
+      pollutant,
+      comparison = "NEI",
+      campd_Mt = CAMPD,
+      comparison_Mt = NEI
+    )
+) %>%
+  filter(
+    is.finite(campd_Mt),
+    is.finite(comparison_Mt),
+    campd_Mt >= 0,
+    comparison_Mt >= 0
+  ) %>%
+  mutate(
+    comparison = factor(comparison, levels = c("eGRID", "NEI")),
+    panel = paste(fuel_group, pollutant, sep = " | "),
+    panel = factor(
+      panel,
+      levels = c(
+        "Coal | NOX", "Gas | NOX", "Oil | NOX",
+        "Coal | SO2", "Gas | SO2", "Oil | SO2"
+      ),
+      labels = c(
+        "bold(Coal)~NO[x]",
+        "bold(Gas)~NO[x]",
+        "bold(Oil)~NO[x]",
+        "bold(Coal)~SO[2]",
+        "bold(Gas)~SO[2]",
+        "bold(Oil)~SO[2]"
+      )
+    )
+  )
+
+if (nrow(s1_comparison) == 0) {
+  stop("No overlapping CAMPD–eGRID or CAMPD–NEI observations were found.")
+}
+
+stage_write_csv(
+  s1_comparison,
+  file.path(PROCESSED_DIR, "Figure_S1_scatter_data.csv")
+)
+
+# ================================================================
+# 7. Calculate agreement statistics
+# ================================================================
+
+safe_r_squared <- function(x, y) {
+  keep <- is.finite(x) & is.finite(y)
+  x <- x[keep]
+  y <- y[keep]
+
+  if (length(x) < 2 || sd(x) == 0 || sd(y) == 0) {
+    return(NA_real_)
+  }
+
+  cor(x, y)^2
+}
+
+agreement_metrics <- s1_comparison %>%
+  group_by(panel, comparison) %>%
+  summarise(
+    n_years = n(),
+    first_year = min(year),
+    last_year = max(year),
+    r_squared = safe_r_squared(campd_Mt, comparison_Mt),
+    median_relative_difference_pct = {
+      differences <- if_else(
+        campd_Mt > 0,
+        100 * (comparison_Mt - campd_Mt) / campd_Mt,
+        NA_real_
+      )
+      if (all(is.na(differences))) {
+        NA_real_
+      } else {
+        median(differences, na.rm = TRUE)
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric_label = if_else(
+      is.finite(r_squared) & is.finite(median_relative_difference_pct),
+      sprintf(
+        "%s: n = %d, R\u00B2 = %.2f, median \u0394 = %+.0f%%",
+        comparison,
+        n_years,
+        r_squared,
+        median_relative_difference_pct
+      ),
+      sprintf("%s: n = %d", comparison, n_years)
+    ),
+    label_row = if_else(comparison == "eGRID", 1L, 2L)
+  )
+
+stage_write_csv(
+  agreement_metrics,
+  file.path(PROCESSED_DIR, "Figure_S1_agreement_metrics.csv")
+)
+
+# Force identical x and y limits within each panel so the one-to-one line is
+# visually meaningful even though fuels have very different emission ranges.
+panel_limits <- s1_comparison %>%
+  group_by(panel) %>%
+  summarise(
+    panel_max = max(c(campd_Mt, comparison_Mt), na.rm = TRUE) * 1.07,
+    .groups = "drop"
+  ) %>%
+  mutate(panel_max = if_else(panel_max > 0, panel_max, 1))
+
+limit_points <- bind_rows(
+  panel_limits %>% transmute(panel, x = 0, y = 0),
+  panel_limits %>% transmute(panel, x = panel_max, y = panel_max)
+)
+
+# ================================================================
+# 8. Draw the revised Figure S1
+# ================================================================
+
+s1_colors <- c("eGRID" = "#005A8D", "NEI" = "#C43C22")
+s1_shapes <- c("eGRID" = 16, "NEI" = 17)
+
+egrid_n <- n_distinct(
+  s1_comparison$year[s1_comparison$comparison == "eGRID"]
+)
+nei_n <- n_distinct(
+  s1_comparison$year[s1_comparison$comparison == "NEI"]
+)
+s1_legend_labels <- c("eGRID" = "eGRID", "NEI" = "NEI")
+
+if (egrid_n <= 3) {
+  warning(
+    "Only ", egrid_n,
+    " eGRID years are present in the assembled comparison data. ",
+    "Confirm that this limited coverage is intended before publication."
+  )
+}
+
+egrid_all_zero_panels <- s1_comparison %>%
+  filter(comparison == "eGRID") %>%
+  group_by(panel) %>%
+  summarise(all_zero = all(comparison_Mt == 0), .groups = "drop") %>%
+  filter(all_zero)
+
+if (nrow(egrid_all_zero_panels) > 0) {
+  warning(
+    "eGRID values are zero for all years in: ",
+    paste(as.character(egrid_all_zero_panels$panel), collapse = ", "),
+    ". Check the eGRID fuel-code mapping before using the figure."
+  )
+}
+
 figS1_plot <- ggplot(
-  s1_plot_data,
+  s1_comparison,
   aes(
-    x = year,
-    y = value_Mt,
-    color = dataset,
-    linetype = dataset,
-    shape = dataset,
-    group = dataset
+    x = campd_Mt,
+    y = comparison_Mt,
+    color = comparison,
+    shape = comparison
   )
 ) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 1.8, stroke = 0.35) +
-  facet_grid(pollutant ~ fuel_group, labeller = label_parsed) +
-  scale_color_manual(values = s1_colors, name = NULL) +
-  scale_linetype_manual(values = s1_linetypes, name = NULL) +
-  scale_shape_manual(values = s1_shapes, name = NULL) +
+  geom_blank(
+    data = limit_points,
+    aes(x = x, y = y),
+    inherit.aes = FALSE
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "#4D4D4D",
+    linewidth = 0.70,
+    linetype = "dashed"
+  ) +
+  geom_point(
+    size = 3.05,
+    stroke = 0.45,
+    alpha = 1
+  ) +
+  facet_wrap(
+    vars(panel),
+    nrow = 2,
+    scales = "free",
+    labeller = label_parsed
+  ) +
+  scale_color_manual(
+    values = s1_colors,
+    labels = s1_legend_labels,
+    name = "Comparison inventory"
+  ) +
+  scale_shape_manual(
+    values = s1_shapes,
+    labels = s1_legend_labels,
+    name = "Comparison inventory"
+  ) +
   scale_x_continuous(
-    breaks = s1_year_breaks,
-    limits = c(min(s1_plot_data$year) - 1, max(s1_plot_data$year) + 1),
-    expand = expansion(mult = c(0, 0))
+    labels = label_number(accuracy = 0.01, trim = TRUE),
+    expand = expansion(mult = c(0.02, 0.055))
   ) +
   scale_y_continuous(
-    labels = label_number(accuracy = 1, big.mark = ","),
-    expand = expansion(mult = c(0.02, 0.07))
+    labels = label_number(accuracy = 0.01, trim = TRUE),
+    expand = expansion(mult = c(0.02, 0.055))
   ) +
   labs(
-    x = "Year",
-    y = "Emissions (million metric tons)"
+    x = expression(CAMPD~emissions~(million~metric~tons~yr^{-1})),
+    y = expression(
+      Other~inventory~emissions~(million~metric~tons~yr^{-1})
+    )
   ) +
-  theme_classic(base_size = 10, base_family = "sans") +
+  theme_classic(base_size = 11.5, base_family = "sans") +
   theme(
     text = element_text(color = "black"),
-    axis.title = element_text(size = 10),
-    axis.text = element_text(size = 8.5, color = "black"),
-    axis.ticks = element_line(color = "black", linewidth = 0.35),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9.5, color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.45),
     axis.ticks.length = grid::unit(0.13, "cm"),
-    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.45),
-    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.3),
-    panel.grid.major.x = element_blank(),
-    panel.grid.minor = element_blank(),
-    strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.4),
-    strip.text = element_text(
-      size = 9.5, face = "bold", color = "black",
-      margin = margin(3, 4, 3, 4)
+    panel.border = element_rect(
+      color = "black",
+      fill = NA,
+      linewidth = 0.60
     ),
-    strip.text.y.right = element_text(angle = 270),
-    panel.spacing.x = grid::unit(0.65, "lines"),
-    panel.spacing.y = grid::unit(0.55, "lines"),
+    panel.grid.major = element_line(color = "grey89", linewidth = 0.32),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(
+      fill = "grey94",
+      color = "black",
+      linewidth = 0.55
+    ),
+    strip.text = element_text(
+      size = 10.7,
+      color = "black",
+      margin = margin(4, 4, 4, 4)
+    ),
+    panel.spacing = grid::unit(0.85, "lines"),
+    aspect.ratio = 1,
     legend.position = "top",
     legend.direction = "horizontal",
-    legend.text = element_text(size = 9),
-    legend.key.width = grid::unit(1.25, "cm"),
-    legend.margin = margin(0, 0, 3, 0),
-    plot.margin = margin(5, 8, 5, 7)
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 10),
+    legend.key.width = grid::unit(0.9, "cm"),
+    legend.spacing.x = grid::unit(0.35, "cm"),
+    legend.margin = margin(0, 0, 5, 0),
+    plot.margin = margin(6, 9, 6, 8)
   )
 
 print(figS1_plot)
 
 # ================================================================
-# 8. Save Figure S1
+# 9. Save Figure S1
 # ================================================================
 
-S1_PDF <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.pdf")
-S1_PNG <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.png")
-S1_TIFF <- file.path(OUTPUT_DIR, "Figure_S1_modern_emissions_comparison.tiff")
+S1_PDF <- file.path(
+  OUTPUT_DIR,
+  "Figure_S1_inventory_agreement_scatter.pdf"
+)
+S1_PNG <- file.path(
+  OUTPUT_DIR,
+  "Figure_S1_inventory_agreement_scatter.png"
+)
+S1_TIFF <- file.path(
+  OUTPUT_DIR,
+  "Figure_S1_inventory_agreement_scatter.tiff"
+)
 
-ggsave(S1_PDF, figS1_plot, width = 7.4, height = 4.8, units = "in", device = "pdf", bg = "white")
-ggsave(S1_PNG, figS1_plot, width = 7.4, height = 4.8, units = "in", dpi = 600, bg = "white")
-ggsave(
+stage_ggsave(
+  S1_PDF,
+  figS1_plot,
+  width = 7.6,
+  height = 5.9,
+  units = "in",
+  device = "pdf",
+  bg = "white"
+)
+
+stage_ggsave(
+  S1_PNG,
+  figS1_plot,
+  width = 7.6,
+  height = 5.9,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+stage_ggsave(
   S1_TIFF,
   figS1_plot,
-  width = 7.4,
-  height = 4.8,
+  width = 7.6,
+  height = 5.9,
   units = "in",
   dpi = 600,
   compression = "lzw",
   bg = "white"
 )
 
-message("Figure S1 PDF: ", S1_PDF)
-message("Figure S1 PNG: ", S1_PNG)
-message("Figure S1 TIFF: ", S1_TIFF)
-message("Reusable processed data: ", PROCESSED_DIR)
+# All files are fully generated before OneDrive is contacted. A temporary
+# OneDrive problem therefore cannot interrupt the data preparation or plotting.
+publish_results <- publish_project_outputs(PUBLISH_QUEUE)
+
+report_published_file <- function(label, final_path) {
+  result <- publish_results[publish_results$final_path == final_path, , drop = FALSE]
+  if (nrow(result) == 1 && isTRUE(result$copied[1])) {
+    message(label, ": ", final_path)
+  } else if (nrow(result) == 1) {
+    message(label, " local backup: ", result$stage_path[1])
+  }
+}
+
+report_published_file("Figure S1 PDF", S1_PDF)
+report_published_file("Figure S1 PNG", S1_PNG)
+report_published_file("Figure S1 TIFF", S1_TIFF)
+
+failed_outputs <- publish_results %>% filter(!copied)
+if (nrow(failed_outputs) == 0) {
+  message("Reusable processed data and QA files: ", PROCESSED_DIR)
+  message("All staged files were copied to the original project folders.")
+} else {
+  message(
+    nrow(failed_outputs),
+    " file(s) remain in the local staging folder because OneDrive timed out: ",
+    STAGE_ROOT
+  )
+}
+message(
+  "eGRID years shown: ",
+  paste(
+    sort(unique(s1_comparison$year[s1_comparison$comparison == "eGRID"])),
+    collapse = ", "
+  )
+)
+message(
+  "NEI years shown: ",
+  paste(
+    sort(unique(s1_comparison$year[s1_comparison$comparison == "NEI"])),
+    collapse = ", "
+  )
+)
 
