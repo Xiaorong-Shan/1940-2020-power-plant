@@ -2,12 +2,14 @@
 # Power-plant SO2/NOx model rebuild for Table S4
 #
 # This script performs, in one run:
-#   1. CAMPD data assembly and emission-factor calculation;
+#   1. CAMPD unit attributes aggregated to facility-year before a one-to-one
+#      merge with facility-year emissions and emission-factor calculation;
 #   2. facility-level 80:20 development/independent-holdout split;
 #   3. five-fold facility-grouped cross-validation on the development set;
 #   4. independent holdout evaluation on the original g/kWh scale;
 #   5. final refit using all modern facilities;
-#   6. historical 1940-1990 generator predictions with CF = 0.95;
+#   6. historical 1940-1990 facility-year predictions with CF = 0.95,
+#      allocated back to generators for generator-level emissions outputs;
 #   7. generator- and facility-level historical emissions outputs;
 #   8. a low-cost CF = 0.50 sensitivity summary; and
 #   9. ready-to-copy Table S4 values and Results text.
@@ -33,7 +35,7 @@ HISTORICAL_GENERATOR_FILE <- "/Users/xshan2/Library/CloudStorage/OneDrive-George
 # generator2010_gen.csv input is required for this rebuild.
 HISTORICAL_LOCATION_FILE <- NA_character_
 
-OUT_DIR <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/03_powerplant/data/TableS4_full_rebuild"
+OUT_DIR <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/03_powerplant/data/TableS4_facility_level_rebuild"
 
 SEED <- 123L
 DEVELOPMENT_FRACTION <- 0.80
@@ -345,7 +347,7 @@ fwrite(input_manifest, file.path(OUT_DIR, "input_file_manifest.csv"))
 print(input_manifest)
 
 # ------------------------------------------------------------------------------
-# 3. LOAD AND MERGE CAMPD DATA
+# 3. LOAD, AGGREGATE, AND MERGE CAMPD DATA
 # ------------------------------------------------------------------------------
 
 message("\nLoading CAMPD inputs...")
@@ -360,28 +362,8 @@ facility_emission <- data.table::fread(
   check.names = TRUE
 )
 
-common_columns <- intersect(names(facility_info), names(facility_emission))
-if (length(common_columns) == 0L) {
-  stop("The two CAMPD files have no shared columns for merging.")
-}
-
-message(
-  "Merging CAMPD files using ", length(common_columns),
-  " shared column(s): ", paste(common_columns, collapse = ", ")
-)
-
-campd_all <- unique(
-  merge(
-    facility_info,
-    facility_emission,
-    by = common_columns,
-    all = FALSE
-  )
-)
-data.table::setDT(campd_all)
-
-facility_id_column <- pick_column(
-  names(campd_all),
+facility_info_id_column <- pick_column(
+  names(facility_info),
   c(
     "Facility.ID",
     "FacilityID",
@@ -395,13 +377,197 @@ facility_id_column <- pick_column(
     "Plant.ID",
     "Facility.Code"
   ),
-  label = "the CAMPD facility identifier"
+  label = "the CAMPD facility identifier in the attributes file"
 )
+facility_emission_id_column <- pick_column(
+  names(facility_emission),
+  c(
+    "Facility.ID",
+    "FacilityID",
+    "Facility.ID..ORISPL.",
+    "Facility ID (ORISPL)",
+    "ORISPL.Code",
+    "ORISPL Code",
+    "ORIS.Code",
+    "ORISPL",
+    "Plant.Code",
+    "Plant.ID",
+    "Facility.Code"
+  ),
+  label = "the CAMPD facility identifier in the emissions file"
+)
+
+required_attribute_columns <- c(
+  "Unit.ID",
+  "Year",
+  "Primary.Fuel.Type",
+  "Unit.Type",
+  "SO2.Controls",
+  "NOx.Controls"
+)
+missing_attribute_columns <- setdiff(
+  required_attribute_columns,
+  names(facility_info)
+)
+if (length(missing_attribute_columns) > 0L) {
+  stop(
+    "The CAMPD attributes file is missing required fields:\n  ",
+    paste(missing_attribute_columns, collapse = "\n  ")
+  )
+}
+
+required_emission_columns <- c(
+  "Year",
+  "Gross.Load..MWh.",
+  "SO2.Mass..short.tons.",
+  "NOx.Mass..short.tons."
+)
+missing_emission_columns <- setdiff(
+  required_emission_columns,
+  names(facility_emission)
+)
+if (length(missing_emission_columns) > 0L) {
+  stop(
+    "The CAMPD emissions file is missing required fields:\n  ",
+    paste(missing_emission_columns, collapse = "\n  ")
+  )
+}
+
+dominant_value <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & nzchar(x)]
+  if (length(x) == 0L) return(NA_character_)
+  counts <- sort(table(x), decreasing = TRUE)
+  tied <- names(counts)[counts == counts[1L]]
+  sort(tied)[1L]
+}
+
+collapse_controls <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sort(unique(x[!is.na(x) & nzchar(x)]))
+  if (length(x) == 0L) return(NA_character_)
+  paste(x, collapse = " | ")
+}
+
+fuel_category <- function(x) {
+  x <- as.character(x)
+  answer <- rep("Other", length(x))
+  answer[grepl("coal", x, ignore.case = TRUE)] <- "Coal"
+  answer[
+    answer == "Other" &
+      grepl("gas", x, ignore.case = TRUE)
+  ] <- "Gas"
+  answer[
+    answer == "Other" &
+      grepl("oil|diesel|petroleum", x, ignore.case = TRUE)
+  ] <- "Oil"
+  answer[
+    answer == "Other" &
+      grepl("wood|biomass", x, ignore.case = TRUE)
+  ] <- "Biomass"
+  answer
+}
+
+data.table::setDT(facility_info)
+data.table::setDT(facility_emission)
+
+facility_info_standard <- data.table(
+  facility_id = as.character(
+    facility_info[[facility_info_id_column]]
+  ),
+  Unit.ID = as.character(facility_info[["Unit.ID"]]),
+  Year = as.integer(facility_info[["Year"]]),
+  Primary.Fuel.Type = fuel_category(
+    facility_info[["Primary.Fuel.Type"]]
+  ),
+  Unit.Type = trimws(
+    gsub(
+      "\\s*\\([^)]*\\)",
+      "",
+      as.character(facility_info[["Unit.Type"]])
+    )
+  ),
+  SO2.Controls = as.character(facility_info[["SO2.Controls"]]),
+  NOx.Controls = as.character(facility_info[["NOx.Controls"]])
+)
+
+facility_attributes_by_year <- facility_info_standard[
+  !is.na(facility_id) & nzchar(facility_id) & is.finite(Year),
+  .(
+    n_attribute_unit_rows = .N,
+    n_units = uniqueN(Unit.ID, na.rm = TRUE),
+    Primary.Fuel.Type = dominant_value(Primary.Fuel.Type),
+    Unit.Type = dominant_value(Unit.Type),
+    SO2.Controls = collapse_controls(SO2.Controls),
+    NOx.Controls = collapse_controls(NOx.Controls)
+  ),
+  by = .(facility_id, Year)
+]
+
+facility_emission_standard <- data.table(
+  facility_id = as.character(
+    facility_emission[[facility_emission_id_column]]
+  ),
+  Year = as.integer(facility_emission[["Year"]]),
+  Gross.Load..MWh. = as.numeric(
+    facility_emission[["Gross.Load..MWh."]]
+  ),
+  SO2.Mass..short.tons. = as.numeric(
+    facility_emission[["SO2.Mass..short.tons."]]
+  ),
+  NOx.Mass..short.tons. = as.numeric(
+    facility_emission[["NOx.Mass..short.tons."]]
+  )
+)
+
+if (
+  facility_attributes_by_year[
+    ,
+    anyDuplicated(paste(facility_id, Year, sep = "::"))
+  ] > 0L
+) {
+  stop("Aggregated CAMPD attributes are not unique by facility-year.")
+}
+if (
+  facility_emission_standard[
+    ,
+    anyDuplicated(paste(facility_id, Year, sep = "::"))
+  ] > 0L
+) {
+  stop("CAMPD emissions are not unique by facility-year.")
+}
+
+campd_all <- merge(
+  facility_attributes_by_year,
+  facility_emission_standard,
+  by = c("facility_id", "Year"),
+  all = FALSE
+)
+data.table::setDT(campd_all)
+
+invalid_direct_merge_rows <- merge(
+  facility_info_standard[, .(facility_id, Year)],
+  facility_emission_standard[, .(facility_id, Year)],
+  by = c("facility_id", "Year"),
+  all = FALSE,
+  allow.cartesian = TRUE
+)[, .N]
+
+campd_merge_qa <- data.table(
+  attribute_unit_year_rows = nrow(facility_info_standard),
+  unique_attribute_facility_years = nrow(facility_attributes_by_year),
+  emission_facility_year_rows = nrow(facility_emission_standard),
+  merged_facility_year_rows = nrow(campd_all),
+  invalid_direct_merge_rows = invalid_direct_merge_rows
+)
+fwrite(campd_merge_qa, file.path(OUT_DIR, "CAMPD_merge_level_QA.csv"))
+print(campd_merge_qa)
+
+facility_id_column <- "facility_id"
 message("Facility grouping column: ", facility_id_column)
 
 # Required CAMPD fields used by both models.
 required_campd_columns <- c(
-  "Commercial.Operation.Date",
   "Primary.Fuel.Type",
   "Unit.Type",
   "Year",
@@ -423,18 +589,6 @@ if (length(missing_campd_columns) > 0L) {
 # 4. BUILD POLLUTANT-SPECIFIC MODEL DATA
 # ------------------------------------------------------------------------------
 
-fuel_category <- function(x) {
-  x <- as.character(x)
-  answer <- rep("Other", length(x))
-  answer[grepl("coal", x, ignore.case = TRUE)] <- "Coal"
-  answer[grepl("gas", x, ignore.case = TRUE)] <- "Gas"
-  answer[
-    grepl("oil|diesel|petroleum", x, ignore.case = TRUE)
-  ] <- "Oil"
-  answer[grepl("wood|biomass", x, ignore.case = TRUE)] <- "Biomass"
-  answer
-}
-
 flag_pattern <- function(x, pattern) {
   as.integer(
     !is.na(x) &
@@ -449,7 +603,6 @@ prepare_pollutant_data <- function(pollutant) {
   }
 
   dt <- data.table::copy(campd_all)
-  operation_date <- as.Date(dt[["Commercial.Operation.Date"]])
   gross_generation_kwh <- as.numeric(dt[["Gross.Load..MWh."]]) * 1000
 
   if (pollutant == "SO2") {
@@ -475,15 +628,18 @@ prepare_pollutant_data <- function(pollutant) {
     gross_generation_kWh = gross_generation_kwh,
     log_Gen_kWh = log10(gross_generation_kwh + 1),
     EF = ef,
-    log_EF = log10(ef + 1),
-    operation_date = operation_date
+    log_EF = log10(ef + 1)
   )
 
   if (pollutant == "SO2") {
     # FGD is intentionally broad; SDA and DSI remain separate indicators.
     model_dt[, SO2_FGD := flag_pattern(
       controls_text,
-      "scrubber|flue.?gas.?desul|\\bFGD\\b"
+      paste0(
+        "scrubber|flue.?gas.?desul|\\bFGD\\b|wet.?limestone|",
+        "wet.?lime|dry.?lime.?FGD|magnesium.?oxide|dual.?alkali|",
+        "sodium.?based"
+      )
     )]
     model_dt[, SO2_SDA := flag_pattern(
       controls_text,
@@ -514,10 +670,43 @@ prepare_pollutant_data <- function(pollutant) {
 
   n_before <- nrow(model_dt)
 
+  filter_qa <- data.table(
+    pollutant = pollutant,
+    facility_year_rows = n_before,
+    nonmissing_facility_id = sum(
+      !is.na(model_dt$facility_id) &
+        nzchar(model_dt$facility_id)
+    ),
+    nonmissing_unit_type = sum(
+      !is.na(model_dt$Unit.Type) &
+        nzchar(model_dt$Unit.Type)
+    ),
+    year_1995_2020 = sum(
+      is.finite(model_dt$Year) &
+        model_dt$Year >= 1995L &
+        model_dt$Year <= 2020L
+    ),
+    positive_generation = sum(
+      is.finite(model_dt$gross_generation_kWh) &
+        model_dt$gross_generation_kWh > 0
+    ),
+    nonnegative_EF_below_limit = sum(
+      is.finite(model_dt$EF) &
+        model_dt$EF >= 0 &
+        model_dt$EF < MAX_EF_G_PER_KWH
+    )
+  )
+  fwrite(
+    filter_qa,
+    file.path(
+      OUT_DIR,
+      paste0(pollutant, "_preclean_filter_QA.csv")
+    )
+  )
+  print(filter_qa)
+
   model_dt <- model_dt[
-    !is.na(operation_date) &
-      operation_date > as.Date("1939-12-31") &
-      !is.na(facility_id) &
+    !is.na(facility_id) &
       nzchar(facility_id) &
       !is.na(Unit.Type) &
       nzchar(Unit.Type) &
@@ -1477,24 +1666,77 @@ prepare_historical_base <- function(capacity_factor) {
   combined
 }
 
+weighted_dominant_value <- function(value, weight) {
+  dt <- data.table(
+    value = as.character(value),
+    weight = as.numeric(weight)
+  )
+  dt <- dt[
+    !is.na(value) &
+      nzchar(value) &
+      is.finite(weight) &
+      weight > 0
+  ]
+  if (nrow(dt) == 0L) return(NA_character_)
+  dt <- dt[, .(weight = sum(weight)), by = value]
+  setorder(dt, -weight, value)
+  dt$value[1L]
+}
+
 predict_historical_pollutant <- function(base, model_result) {
-  prediction_data <- copy(base)
+  generator_data <- copy(base)
+  unit_mapping <- historical_unit_mapping(
+    generator_data$Prime_Mover,
+    generator_data$convert_fuel,
+    model_result$unit_levels,
+    model_result$data
+  )
+  generator_data[
+    ,
+    generator_mapped_Unit.Type := unit_mapping$Unit.Type
+  ]
+  generator_data[
+    ,
+    generator_unit_type_mapping_method := unit_mapping$mapping_method
+  ]
+
+  # The modern response is facility-year, so the historical predictors must
+  # also be facility-year. Capacity-weighted dominant categories are used
+  # because historical unit-level generation is unavailable.
+  prediction_data <- generator_data[
+    ,
+    .(
+      annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
+      convert_fuel = weighted_dominant_value(
+        convert_fuel,
+        max_capacity_MW
+      ),
+      Unit.Type = weighted_dominant_value(
+        generator_mapped_Unit.Type,
+        max_capacity_MW
+      )
+    ),
+    by = .(Year, Plant_ID)
+  ]
+  prediction_data[, log_Gen_kWh := log10(annual_gen_kWh + 1)]
   prediction_data[, convert_fuel := factor(
     convert_fuel,
     levels = model_result$fuel_levels
   )]
-  unit_mapping <- historical_unit_mapping(
-    prediction_data$Prime_Mover,
-    as.character(prediction_data$convert_fuel),
-    model_result$unit_levels,
-    model_result$data
-  )
-  prediction_data[, Unit.Type := unit_mapping$Unit.Type]
-  prediction_data[, unit_type_mapping_method := unit_mapping$mapping_method]
   prediction_data[, Unit.Type := factor(
     Unit.Type,
     levels = model_result$unit_levels
   )]
+
+  if (
+    any(is.na(prediction_data$convert_fuel)) ||
+      any(is.na(prediction_data$Unit.Type))
+  ) {
+    stop(
+      "Historical facility-year predictor aggregation created an ",
+      "unavailable fuel or unit-type level."
+    )
+  }
 
   for (control_column in model_result$controls) {
     prediction_data[, (control_column) := 0L]
@@ -1520,37 +1762,61 @@ predict_historical_pollutant <- function(base, model_result) {
     "NOx",
     "SO2"
   )
-  result <- data.table(
-    historical_row_id = prediction_data$historical_row_id,
+  facility_result <- data.table(
+    Year = prediction_data$Year,
+    Plant_ID = prediction_data$Plant_ID,
     mapped_Unit_Type = as.character(prediction_data$Unit.Type),
-    unit_type_mapping_method = prediction_data$unit_type_mapping_method,
+    unit_type_mapping_method =
+      "capacity-dominant facility-year aggregation",
     predicted_log10_EF = prediction_log,
-    predicted_EF_g_per_kWh = prediction_ef,
-    emissions_tons = (
-      prediction_ef * prediction_data$annual_gen_kWh
-    ) / GRAMS_PER_SHORT_TON
+    predicted_EF_g_per_kWh = prediction_ef
   )
   setnames(
-    result,
+    facility_result,
     c(
       "mapped_Unit_Type",
       "unit_type_mapping_method",
       "predicted_log10_EF",
-      "predicted_EF_g_per_kWh",
-      "emissions_tons"
+      "predicted_EF_g_per_kWh"
     ),
     paste0(
       c(
         "mapped_Unit_Type_",
         "unit_type_mapping_method_",
         "predicted_log10_EF_",
-        "predicted_EF_g_per_kWh_",
-        "emissions_tons_"
+        "predicted_EF_g_per_kWh_"
       ),
       pollutant_label
     )
   )
-  result
+
+  generator_mapping <- generator_data[
+    ,
+    .(
+      historical_row_id,
+      generator_mapped_Unit.Type,
+      generator_unit_type_mapping_method
+    )
+  ]
+  setnames(
+    generator_mapping,
+    c(
+      "generator_mapped_Unit.Type",
+      "generator_unit_type_mapping_method"
+    ),
+    paste0(
+      c(
+        "generator_mapped_Unit_Type_",
+        "generator_unit_type_mapping_method_"
+      ),
+      pollutant_label
+    )
+  )
+
+  list(
+    facility = facility_result,
+    generator_mapping = generator_mapping
+  )
 }
 
 run_historical_prediction <- function(capacity_factor) {
@@ -1566,16 +1832,42 @@ run_historical_prediction <- function(capacity_factor) {
 
   result <- merge(
     base,
-    so2_prediction,
+    so2_prediction$generator_mapping,
     by = "historical_row_id",
     all.x = TRUE
   )
   result <- merge(
     result,
-    nox_prediction,
+    nox_prediction$generator_mapping,
     by = "historical_row_id",
     all.x = TRUE
   )
+  result <- merge(
+    result,
+    so2_prediction$facility,
+    by = c("Year", "Plant_ID"),
+    all.x = TRUE
+  )
+  result <- merge(
+    result,
+    nox_prediction$facility,
+    by = c("Year", "Plant_ID"),
+    all.x = TRUE
+  )
+  result[
+    ,
+    emissions_tons_SO2 :=
+      predicted_EF_g_per_kWh_SO2 *
+      annual_gen_kWh /
+      GRAMS_PER_SHORT_TON
+  ]
+  result[
+    ,
+    emissions_tons_NOx :=
+      predicted_EF_g_per_kWh_NOx *
+      annual_gen_kWh /
+      GRAMS_PER_SHORT_TON
+  ]
   setorder(result, Year, Plant_ID, Generator_ID)
   result
 }
@@ -1599,8 +1891,12 @@ generator_output_columns <- c(
   "Prime_Mover_Source",
   "mapped_Unit_Type_SO2",
   "unit_type_mapping_method_SO2",
+  "generator_mapped_Unit_Type_SO2",
+  "generator_unit_type_mapping_method_SO2",
   "mapped_Unit_Type_NOx",
   "unit_type_mapping_method_NOx",
+  "generator_mapped_Unit_Type_NOx",
+  "generator_unit_type_mapping_method_NOx",
   "Operating_Year",
   "Retirement_Year",
   "max_capacity_MW",
@@ -1633,11 +1929,10 @@ historical_unit_mapping_qa <- rbindlist(
         Prime_Mover_Source,
         Prime_Mover,
         convert_fuel,
-        mapped_Unit_Type = mapped_Unit_Type_SO2,
-        mapping_method = unit_type_mapping_method_SO2
+        mapped_Unit_Type = generator_mapped_Unit_Type_SO2,
+        mapping_method = generator_unit_type_mapping_method_SO2
       )
     ][, pollutant := "SO2"],
-    
     historical_generator_primary[
       ,
       .N,
@@ -1645,8 +1940,8 @@ historical_unit_mapping_qa <- rbindlist(
         Prime_Mover_Source,
         Prime_Mover,
         convert_fuel,
-        mapped_Unit_Type = mapped_Unit_Type_NOx,
-        mapping_method = unit_type_mapping_method_NOx
+        mapped_Unit_Type = generator_mapped_Unit_Type_NOx,
+        mapping_method = generator_unit_type_mapping_method_NOx
       )
     ][, pollutant := "NOx"]
   ),
@@ -1727,16 +2022,21 @@ fwrite(
   )
 )
 
-year_fuel_summary <- historical_generator_primary[
+year_fuel_summary <- historical_facility_primary[
   ,
   .(
-    generators = .N,
-    capacity_MW = sum(max_capacity_MW, na.rm = TRUE),
+    generators = sum(n_generators, na.rm = TRUE),
+    facilities = .N,
+    capacity_MW = sum(total_capacity_MW, na.rm = TRUE),
     annual_gen_kWh = sum(annual_gen_kWh, na.rm = TRUE),
-    SO2_tons = sum(emissions_tons_SO2, na.rm = TRUE),
-    NOx_tons = sum(emissions_tons_NOx, na.rm = TRUE)
+    SO2_tons = sum(SO2_tons, na.rm = TRUE),
+    NOx_tons = sum(NOx_tons, na.rm = TRUE)
   ),
-  by = .(Year, convert_fuel, capacity_factor)
+  by = .(
+    Year,
+    convert_fuel = dominant_fuel,
+    capacity_factor
+  )
 ][order(Year, convert_fuel)]
 
 year_total_summary <- historical_generator_primary[
@@ -1865,9 +2165,11 @@ table_s4_ready <- data.table(
   ),
   Specification = c(
     paste0(
-      "CAMPD unit-year records for 1995-2020 with nonnegative ",
-      "SO2 or NOx mass emissions, positive gross generation and ",
-      "emission factors below ", MAX_EF_G_PER_KWH, " g kWh^-1."
+      "CAMPD unit attributes were aggregated to facility-year and ",
+      "merged one-to-one with facility-year emissions for 1995-2020. ",
+      "Records retained nonnegative SO2 or NOx mass emissions, positive ",
+      "gross generation and emission factors below ",
+      MAX_EF_G_PER_KWH, " g kWh^-1."
     ),
     paste0(
       "Separate SO2 and NOx models used log10(EF + 1). ",
@@ -1927,13 +2229,17 @@ table_s4_ready <- data.table(
       "unit types. Where the source identified only a broad steam or fuel ",
       "technology and not a CAMPD boiler subtype, unit type was imputed as ",
       "the most frequent modern CAMPD unit type within that fuel category; ",
-      "the mapping method was retained in the generator-level audit output."
+      "the mapping method was retained in the generator-level audit output. ",
+      "Historical predictor rows were then aggregated to facility-year ",
+      "using capacity-weighted dominant fuel and unit type before prediction."
     ),
     "All historical pollutant-specific control indicators were set to zero.",
     paste0(
       "Predicted emission factors were multiplied by estimated ",
       "generation, converted using ", GRAMS_PER_SHORT_TON,
-      " g per short ton and summed by Plant ID."
+      " g per short ton and summed by Plant ID; facility-year factors ",
+      "were allocated to generators in proportion to estimated generation ",
+      "for the generator-level audit output."
     )
   )
 )
