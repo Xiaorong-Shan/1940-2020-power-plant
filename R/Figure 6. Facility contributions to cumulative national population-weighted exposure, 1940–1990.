@@ -1,12 +1,12 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Figure 6: facility contributions to cumulative national
-# population-weighted exposure, 1940–1990
+# Figure 6: facility contributions to mean national
+# population-weighted exposure across six analysis years, 1940–1990
 #
-# (a) Facility contribution concentration (Pareto curve)
-# (b) Twenty facilities with the largest cumulative contributions
-# (c) Exposure reduction under two facility-targeting strategies
+# (a) Concentration of mean exposure contributions (Pareto curve)
+# (b) Twenty facilities with the largest mean contributions
+# (c) Reduction in mean exposure under two targeting strategies
 # ================================================================
 
 rm(list = ls(all.names = TRUE))
@@ -42,11 +42,6 @@ FIG6_FACILITY_FILE <- file.path(
   "facility_cumulative_contribution_1940_1990.csv"
 )
 
-FIG6_SHARE_FILE <- file.path(
-  FIG6_DATA_DIR,
-  "FIG_4A_top_facility_exposure_shares.csv"
-)
-
 FIG6_TOP_FILE <- file.path(
   FIG6_DATA_DIR,
   "FIG_4B_top_facility_contributions.csv"
@@ -57,13 +52,14 @@ FIG6_TARGET_FILE <- file.path(
   "FIG_4C_targeting_efficiency.csv"
 )
 
-FIG6_WIDTH <- 7.4
+FIG6_WIDTH <- 7.6
 FIG6_HEIGHT <- 7.8
 FIG6_DPI <- 600
+FIG6_ANALYSIS_YEARS <- c(1940, 1950, 1960, 1970, 1980, 1990)
+FIG6_N_ANALYSIS_YEARS <- length(FIG6_ANALYSIS_YEARS)
 
 required_files <- c(
   FIG6_FACILITY_FILE,
-  FIG6_SHARE_FILE,
   FIG6_TOP_FILE,
   FIG6_TARGET_FILE
 )
@@ -111,16 +107,14 @@ fig6_theme <- function(base_size = 10) {
 # ------------------------------
 
 fig6_facility <- fread(FIG6_FACILITY_FILE)
-fig6_shares <- fread(FIG6_SHARE_FILE)
 fig6_top <- fread(FIG6_TOP_FILE)
 fig6_target <- fread(FIG6_TARGET_FILE)
 
 facility_required <- c(
   "Plant_ID", "cumulative_exposure_contrib", "cumulative_SO2_tons"
 )
-share_required <- c("cutoff", "exposure_percent", "total_facilities")
 top_required <- c(
-  "Plant_ID", "cumulative_exposure_contrib", "Plant_Name", "Plant_State", "label"
+  "Plant_ID", "cumulative_exposure_contrib", "Plant_Name", "Plant_State"
 )
 target_required <- c(
   "cutoff_percent", "strategy", "exposure_reduction_percent", "n_removed"
@@ -128,9 +122,6 @@ target_required <- c(
 
 if (length(setdiff(facility_required, names(fig6_facility))) > 0) {
   stop("Facility cumulative-contribution file has missing columns.")
-}
-if (length(setdiff(share_required, names(fig6_shares))) > 0) {
-  stop("Facility exposure-share file has missing columns.")
 }
 if (length(setdiff(top_required, names(fig6_top))) > 0) {
   stop("Top-facility file has missing columns.")
@@ -149,6 +140,16 @@ fig6_facility <- fig6_facility[
 
 if (nrow(fig6_facility) == 0 || sum(fig6_facility$cumulative_exposure_contrib) <= 0) {
   stop("No positive cumulative facility exposure contributions were found.")
+}
+
+fig6_target[, cutoff_percent := as.numeric(cutoff_percent)]
+fig6_target[, exposure_reduction_percent := as.numeric(exposure_reduction_percent)]
+fig6_target <- fig6_target[
+  is.finite(cutoff_percent) & is.finite(exposure_reduction_percent)
+]
+
+if (nrow(fig6_target) == 0) {
+  stop("No valid targeting-efficiency records were found.")
 }
 
 # ------------------------------
@@ -175,8 +176,30 @@ fig6_pareto <- rbind(
   )]
 )
 
-fig6_shares[, facilities_ranked_percent := as.numeric(cutoff) * 100]
-fig6_shares[, exposure_percent := as.numeric(exposure_percent)]
+# The open circles are drawn directly from the exposure-based series in
+# panel (c), so their meaning and cutoffs are unambiguous. The zero point is
+# already represented by the origin of the Pareto curve and is not marked.
+fig6_panel_a_points <- unique(
+  fig6_target[
+    strategy == "Exposure-based ranking" & cutoff_percent > 0,
+    .(
+      facilities_ranked_percent = cutoff_percent,
+      exposure_percent = exposure_reduction_percent
+    )
+  ]
+)
+setorder(fig6_panel_a_points, facilities_ranked_percent)
+
+if (nrow(fig6_panel_a_points) == 0) {
+  stop(
+    "Panel (a) cannot identify the exposure-based cutoffs used in panel (c)."
+  )
+}
+
+fig6_panel_a_points[, cutoff_label := paste0(
+  format(facilities_ranked_percent, trim = TRUE, scientific = FALSE),
+  "%"
+)]
 
 fig6_panel_a <- ggplot(
   fig6_pareto,
@@ -194,7 +217,7 @@ fig6_panel_a <- ggplot(
   ) +
   geom_line(color = "#0072B2", linewidth = 1.05) +
   geom_point(
-    data = fig6_shares,
+    data = fig6_panel_a_points,
     aes(
       x = facilities_ranked_percent,
       y = exposure_percent
@@ -205,6 +228,19 @@ fig6_panel_a <- ggplot(
     stroke = 0.65,
     color = "#0072B2",
     fill = "white"
+  ) +
+  geom_text(
+    data = fig6_panel_a_points,
+    aes(
+      x = facilities_ranked_percent,
+      y = exposure_percent,
+      label = cutoff_label
+    ),
+    inherit.aes = FALSE,
+    color = "#0072B2",
+    size = 2.5,
+    nudge_y = 4,
+    check_overlap = TRUE
   ) +
   scale_x_continuous(
     breaks = seq(0, 100, by = 25),
@@ -218,8 +254,8 @@ fig6_panel_a <- ggplot(
   ) +
   labs(
     title = "(a)",
-    x = "Facilities ranked by exposure contribution (%)",
-    y = "Cumulative exposure contribution (%)"
+    x = "Facility cutoff (%)",
+    y = "Cumulative share of mean national PWE (%)"
   ) +
   fig6_theme(base_size = 9.5) +
   theme(plot.margin = margin(5, 8, 8, 7))
@@ -236,12 +272,57 @@ fig6_top <- fig6_top[
 setorder(fig6_top, -cumulative_exposure_contrib)
 fig6_top <- head(fig6_top, 20)
 
+fig6_top[, facility_name := trimws(as.character(Plant_Name))]
 fig6_top[
-  is.na(label) | trimws(label) == "",
-  label := paste0("Plant ", Plant_ID)
+  is.na(facility_name) |
+    facility_name == "" |
+    toupper(facility_name) %in% c("NA", "N/A", "UNKNOWN"),
+  facility_name := paste0("Plant ", Plant_ID)
 ]
 
-fig6_top[, contribution_scaled := cumulative_exposure_contrib * 1e3]
+fig6_top[, state_label := toupper(trimws(as.character(Plant_State)))]
+
+# Four state values are absent from the legacy Figure 6 CSV. Fill them from
+# the plant-code metadata so the labels satisfy the reviewer request.
+state_fallback <- c(
+  "3975" = "WI",
+  "3974" = "WI",
+  "10279" = "KS",
+  "8902" = "AZ"
+)
+fig6_top[
+  (is.na(state_label) |
+    state_label == "" |
+    state_label %in% c("NA", "N/A", "UNKNOWN")) &
+    as.character(Plant_ID) %in% names(state_fallback),
+  state_label := unname(state_fallback[as.character(Plant_ID)])
+]
+
+missing_state_ids <- fig6_top[
+  is.na(state_label) |
+    state_label == "" |
+    state_label %in% c("NA", "N/A", "UNKNOWN"),
+  as.character(Plant_ID)
+]
+
+if (length(missing_state_ids) > 0) {
+  stop(
+    paste0(
+      "Plant_State is missing for the following top-20 facilities: ",
+      paste(missing_state_ids, collapse = ", "),
+      ". Add the state values before generating Figure 6."
+    )
+  )
+}
+
+fig6_top[, label := paste0(facility_name, ", ", state_label)]
+
+# cumulative_exposure_contrib is the sum across the six historical analysis
+# years. Divide by six before plotting so panel (b) reports a mean
+# concentration in micrograms per cubic meter, not concentration-years.
+fig6_top[, mean_exposure_contrib :=
+  cumulative_exposure_contrib / FIG6_N_ANALYSIS_YEARS]
+fig6_top[, contribution_scaled := mean_exposure_contrib * 1e3]
 fig6_top[, plot_label := factor(label, levels = rev(unique(label)))]
 
 fig6_panel_b <- ggplot(
@@ -250,15 +331,16 @@ fig6_panel_b <- ggplot(
 ) +
   geom_col(width = 0.68, fill = "#3B6FB6") +
   scale_x_continuous(
-    labels = label_number(accuracy = 1),
+    labels = label_number(accuracy = 0.1),
     expand = expansion(mult = c(0, 0.06))
   ) +
   labs(
     title = "(b)",
     x = expression(
       atop(
-        "Cumulative contribution to national PWE",
-        "(" * 10^{-3} * " " * mu * "g " * m^{-3} * ")"
+        "Mean contribution to national PWE",
+        "(six-analysis-year mean; " *
+          10^{-3} * " " * mu * "g " * m^{-3} * ")"
       )
     ),
     y = NULL
@@ -266,19 +348,13 @@ fig6_panel_b <- ggplot(
   fig6_theme(base_size = 9.2) +
   theme(
     axis.text.y = element_text(size = 7.6),
-    axis.title.x = element_text(size = 8.8, margin = margin(t = 7)),
-    plot.margin = margin(5, 12, 15, 8)
+    axis.title.x = element_text(size = 8.4, margin = margin(t = 7)),
+    plot.margin = margin(5, 6, 10, 8)
   )
 
 # ------------------------------
 # 5. Panel (c): targeting efficiency
 # ------------------------------
-
-fig6_target[, cutoff_percent := as.numeric(cutoff_percent)]
-fig6_target[, exposure_reduction_percent := as.numeric(exposure_reduction_percent)]
-fig6_target <- fig6_target[
-  is.finite(cutoff_percent) & is.finite(exposure_reduction_percent)
-]
 
 strategy_levels <- c(
   "Exposure-based ranking",
@@ -328,7 +404,7 @@ fig6_panel_c <- ggplot(
   labs(
     title = "(c)",
     x = "Facilities targeted (%)",
-    y = "Cumulative exposure reduced (%)"
+    y = "Mean national PWE reduced (%)"
   ) +
   guides(
     color = guide_legend(nrow = 2, byrow = TRUE),
@@ -358,7 +434,7 @@ fig6_combined_grob <- gridExtra::arrangeGrob(
   fig6_panel_b,
   fig6_panel_c,
   layout_matrix = fig6_layout,
-  widths = c(0.84, 1.16),
+  widths = c(0.82, 1.18),
   heights = c(1, 1),
   padding = unit(0.12, "cm")
 )
@@ -452,4 +528,17 @@ if (!fig6_pdf_saved) warning("Figure 6 PDF was not generated.")
 if (!fig6_png_saved) warning("Figure 6 PNG was not generated.")
 if (!fig6_tiff_saved) warning("Figure 6 TIFF was not generated.")
 
+message(
+  "Panel (b) reports the mean across ",
+  FIG6_N_ANALYSIS_YEARS,
+  " analysis years: ",
+  paste(FIG6_ANALYSIS_YEARS, collapse = ", "),
+  "."
+)
+message(
+  "Panel (a) open-circle cutoffs match panel (c): ",
+  paste(fig6_panel_a_points$cutoff_label, collapse = ", "),
+  "."
+)
+message("All top-20 facility labels include a state.")
 message("Figure 6 outputs are located in: ", FIG6_OUT_DIR)
