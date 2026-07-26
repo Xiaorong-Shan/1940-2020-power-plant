@@ -2,7 +2,7 @@
 
 # ================================================================
 # VERSION 2 (eGRID ORISPL-to-subregion crosswalk)
-# Figure S2. Coal-fired SO2 emission rates by selected eGRID regions
+# Figure S2. Coal-fired SO2 emission rates in major eGRID subregions
 # CAMPD, 1996-2020
 # ================================================================
 
@@ -132,10 +132,11 @@ first_nonmissing <- function(x) {
   if (length(x) == 0) NA_character_ else x[1]
 }
 
-selected_regions <- c(
-  "ERCT", "FRCC", "MROW", "RFCE",
-  "RFCW", "SRSO", "SRTV", "SRVC"
-)
+# Select subregions objectively after the emissions data have been assembled.
+# The 12 subregions with the greatest cumulative coal heat input during
+# 1996-2020 are retained, giving a readable 3 x 4 figure while covering the
+# largest coal-generating parts of the U.S. grid.
+n_display_regions <- 12L
 
 # ----------------------------------------------------------------
 # 3. Build ORISPL -> eGRID subregion crosswalk from historical eGRID
@@ -222,7 +223,7 @@ read_egrid_crosswalk <- function(path) {
           ) %>%
           filter(
             !is.na(facility_id), facility_id != "",
-            region %in% selected_regions
+            !is.na(region), region != ""
           ) %>%
           distinct()
       )
@@ -241,7 +242,7 @@ if (nrow(egrid_crosswalk_history) == 0) {
 # A plant can occur in several annual workbooks. Select its most frequently
 # reported subregion; break ties using the most recent workbook year.
 plant_subregion_crosswalk <- egrid_crosswalk_history %>%
-  filter(region %in% selected_regions) %>%
+  filter(!is.na(region), region != "") %>%
   group_by(facility_id, region) %>%
   summarise(
     n_years_reported = n_distinct(egrid_year),
@@ -398,12 +399,51 @@ analysis_data <- analysis_data %>%
   )
 
 message(
-  "Matched analysis rows by eGRID subregion:\n",
+  "Matched coal-emission rows by eGRID subregion:\n",
   paste(capture.output(print(count(analysis_data, region), n = Inf)), collapse = "\n")
 )
 
 # ----------------------------------------------------------------
-# 6. Regional heat-input-weighted SO2 emission rates
+# 6. Select the major coal-generating eGRID subregions
+# ----------------------------------------------------------------
+
+region_selection <- analysis_data %>%
+  filter(
+    is.finite(heat_input_mmbtu),
+    heat_input_mmbtu > 0
+  ) %>%
+  group_by(region) %>%
+  summarise(
+    cumulative_coal_heat_input_mmbtu = sum(heat_input_mmbtu, na.rm = TRUE),
+    n_years = n_distinct(year),
+    n_facilities = n_distinct(facility_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(cumulative_coal_heat_input_mmbtu), region) %>%
+  mutate(
+    rank = row_number(),
+    cumulative_share = cumsum(cumulative_coal_heat_input_mmbtu) /
+      sum(cumulative_coal_heat_input_mmbtu)
+  )
+
+selected_regions <- head(region_selection$region, n_display_regions)
+
+if (length(selected_regions) == 0) {
+  stop("No eGRID subregions were available for selection.")
+}
+
+write_csv(
+  region_selection,
+  file.path(processed_dir, "Figure_S2_subregion_selection.csv")
+)
+
+message(
+  "Selected eGRID subregions (ranked by 1996-2020 cumulative coal heat input): ",
+  paste(selected_regions, collapse = ", ")
+)
+
+# ----------------------------------------------------------------
+# 7. Regional heat-input-weighted SO2 emission rates
 # ----------------------------------------------------------------
 
 regional_rates <- analysis_data %>%
@@ -437,7 +477,7 @@ write_csv(
 print(regional_rates, n = Inf)
 
 # ----------------------------------------------------------------
-# 6. Publication figure
+# 8. Publication figure
 # ----------------------------------------------------------------
 
 fig_s2 <- ggplot(
@@ -467,7 +507,12 @@ fig_s2 <- ggplot(
   ) +
   scale_y_continuous(
     labels = label_number(accuracy = 0.1),
-    expand = expansion(mult = c(0.03, 0.08))
+    limits = c(0, NA),
+    breaks = function(limits) {
+      b <- pretty(c(0, limits[2]), n = 4)
+      b[b >= 0 & b <= limits[2]]
+    },
+    expand = expansion(mult = c(0, 0.08))
   ) +
   labs(
     x = "Year",
@@ -503,7 +548,7 @@ fig_s2 <- ggplot(
 print(fig_s2)
 
 # ----------------------------------------------------------------
-# 7. Save PDF, PNG, and TIFF
+# 9. Save PDF, PNG, and TIFF
 # ----------------------------------------------------------------
 
 pdf_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.pdf")
@@ -512,19 +557,19 @@ tiff_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.tiff")
 
 ggsave(
   pdf_file, fig_s2,
-  width = 7.4, height = 6.1, units = "in",
+  width = 7.4, height = 8.2, units = "in",
   device = cairo_pdf, bg = "white"
 )
 
 ggsave(
   png_file, fig_s2,
-  width = 7.4, height = 6.1, units = "in",
+  width = 7.4, height = 8.2, units = "in",
   dpi = 600, type = "cairo", bg = "white"
 )
 
 ggsave(
   tiff_file, fig_s2,
-  width = 7.4, height = 6.1, units = "in",
+  width = 7.4, height = 8.2, units = "in",
   dpi = 600, compression = "lzw", bg = "white"
 )
 
@@ -534,4 +579,6 @@ message("Figure S2 TIFF: ", tiff_file)
 message("Figure S2 data: ", file.path(
   processed_dir, "Figure_S2_regional_coal_SO2_rates.csv"
 ))
-
+message("Figure S2 selection: ", file.path(
+  processed_dir, "Figure_S2_subregion_selection.csv"
+))
