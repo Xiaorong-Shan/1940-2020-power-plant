@@ -1,0 +1,2147 @@
+#!/usr/bin/env Rscript
+
+# ==============================================================================
+# Figure 3: County-level coal PM2.5 and population-weighted exposure, 1940-2020
+#
+# This script extends the existing Figure 3 workflow to nine decennial years:
+#   1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, and 2020.
+#
+# The same county spatial unit is used throughout:
+#   (a) historical county-mean annual coal PM2.5, 1940-1990
+#   (b) modern county-mean annual coal PM2.5, 2000-2020
+#   (c) distribution of county-mean annual coal PM2.5
+#   (d) national population-weighted exposure (PWE)
+#
+# Historical inputs (1940-1990):
+#   grids_pm25_total_YYYY.fst
+#
+# Modern inputs (2000, 2010, 2020):
+#   grids_pm25_byunit_YYYY.fst
+#   The script sums unit-level PM2.5 internally and writes derived total files.
+#
+# County means are calculated using the same method as the original PWE script:
+# raster::extract(..., weights = TRUE), followed by an area-weighted mean.
+# Lucas' data: https://www.dropbox.com/scl/fo/0aejz6jgfoomfay4drlpg/ABgIUJgrcb2zAQ8KyAIHhvw?rlkey=c2xu5i8lqpmgfj4jwqq3t4zjx&dl=0
+# Run from the shell, not from an interactive R prompt:
+#   Rscript --vanilla Figure_3_county_1940_2020.R \
+#     > Figure_3_county_1940_2020.log 2>&1
+# ==============================================================================
+
+rm(list = ls())
+gc()
+
+if (interactive()) {
+  stop(
+    "Interactive R session detected. Run the complete file with ",
+    "Rscript --vanilla instead of pasting it at the R prompt."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(raster)
+  library(sf)
+  library(USAboundaries)
+  library(data.table)
+  library(fst)
+  library(ggplot2)
+  library(scales)
+  library(methods)
+  library(grid)
+  library(gridExtra)
+})
+
+# ==============================================================================
+# 0. Settings
+# ==============================================================================
+
+HISTORICAL_YEARS <- c(1940L, 1950L, 1960L, 1970L, 1980L, 1990L)
+MODERN_YEARS <- c(2000L, 2010L, 2020L)
+YEARS <- c(HISTORICAL_YEARS, MODERN_YEARS)
+
+BASE_DIR <- paste0(
+  "/scratch/xshan2/R_Code/disperseR/main/output/",
+  "pm25_decades_model.lm.cv_single_poly_proxy1999met"
+)
+
+MODERN_DIR <- paste0(
+  "/scratch/xshan2/R_Code/disperseR/main/input/",
+  "modern_pm25_annual"
+)
+
+POP_FILE <- paste0(
+  "/scratch/xshan2/R_Code/powerplant/data/population/",
+  "nhgis0014_ts_nominal_county.csv"
+)
+
+OUT_DIR <- file.path(
+  BASE_DIR,
+  "figure3_county_1940_2020"
+)
+
+DERIVED_TOTAL_DIR <- file.path(
+  OUT_DIR,
+  "derived_modern_total_grids"
+)
+
+TABLE_DIR <- file.path(
+  OUT_DIR,
+  "tables"
+)
+
+FIG_DIR <- file.path(
+  OUT_DIR,
+  "figures"
+)
+
+QA_DIR <- file.path(
+  OUT_DIR,
+  "qa"
+)
+
+for (this_dir in c(
+  OUT_DIR,
+  DERIVED_TOTAL_DIR,
+  TABLE_DIR,
+  FIG_DIR,
+  QA_DIR
+)) {
+  dir.create(
+    this_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+P4S <- paste(
+  "+proj=aea +lat_1=20 +lat_2=60",
+  "+lat_0=40 +lon_0=-96",
+  "+x_0=0 +y_0=0",
+  "+ellps=GRS80 +datum=NAD83 +units=m"
+)
+
+MAP_CAP_QUANTILE <- 0.99
+
+FIGURE_WIDTH <- 7.4
+FIGURE_HEIGHT <- 11.8
+
+HISTORICAL_MAP_COLORS <- c(
+  "#fff7ec",
+  "#fdd49e",
+  "#fc8d59",
+  "#d7301f",
+  "#7f0000"
+)
+
+MODERN_MAP_COLORS <- c(
+  "#f7fbff",
+  "#c6dbef",
+  "#6baed6",
+  "#2171b5",
+  "#08306b"
+)
+
+# ==============================================================================
+# 1. Helper functions
+# ==============================================================================
+
+fmt_geoid5 <- function(x) {
+  raw_x <- trimws(as.character(x))
+  numeric_x <- suppressWarnings(
+    as.integer(raw_x)
+  )
+
+  valid_x <- grepl(
+    "^[0-9]{1,5}$",
+    raw_x
+  ) &
+    !is.na(numeric_x) &
+    numeric_x >= 0L &
+    numeric_x <= 99999L
+
+  result <- rep(
+    NA_character_,
+    length(raw_x)
+  )
+
+  result[valid_x] <- sprintf(
+    "%05d",
+    numeric_x[valid_x]
+  )
+
+  result
+}
+
+rename_case_insensitive <- function(dt, target, alternatives = target) {
+  if (target %in% names(dt)) {
+    return(invisible(dt))
+  }
+
+  name_lower <- tolower(names(dt))
+  positions <- match(
+    tolower(alternatives),
+    name_lower,
+    nomatch = 0L
+  )
+  positions <- positions[positions > 0L]
+
+  if (length(positions) > 0L) {
+    data.table::setnames(
+      dt,
+      names(dt)[positions[1L]],
+      target
+    )
+  }
+
+  invisible(dt)
+}
+
+resolve_pm25_file <- function(year) {
+  if (year %in% HISTORICAL_YEARS) {
+    return(file.path(
+      BASE_DIR,
+      sprintf("grids_pm25_total_%d.fst", year)
+    ))
+  }
+
+  file.path(
+    MODERN_DIR,
+    sprintf("grids_pm25_byunit_%d.fst", year)
+  )
+}
+
+derive_total_grid <- function(fst_path, year) {
+  dt <- as.data.table(
+    fst::read_fst(fst_path)
+  )
+
+  rename_case_insensitive(
+    dt,
+    "x",
+    c("x", "xcoord", "x_coord", "easting")
+  )
+
+  rename_case_insensitive(
+    dt,
+    "y",
+    c("y", "ycoord", "y_coord", "northing")
+  )
+
+  if (!all(c("x", "y") %in% names(dt))) {
+    stop(
+      "The PM2.5 file for ", year,
+      " does not contain x and y coordinates. Columns are: ",
+      paste(names(dt), collapse = ", ")
+    )
+  }
+
+  dt[, `:=`(
+    x = as.numeric(x),
+    y = as.numeric(y)
+  )]
+
+  # Total-grid schema used by the historical files.
+  preferred_total <- c(
+    "vals.out",
+    "vals_out",
+    "total",
+    "total_pm25",
+    "pm25_total"
+  )
+
+  preferred_match <- preferred_total[
+    tolower(preferred_total) %in% tolower(names(dt))
+  ]
+
+  if (length(preferred_match) > 0L) {
+    actual_name <- names(dt)[
+      match(
+        tolower(preferred_match[1L]),
+        tolower(names(dt))
+      )
+    ]
+
+    total_dt <- dt[
+      ,
+      .(
+        vals.out = sum(
+          as.numeric(get(actual_name)),
+          na.rm = TRUE
+        )
+      ),
+      by = .(x, y)
+    ]
+
+    source_schema <- paste0(
+      "existing_total_column:",
+      actual_name
+    )
+
+  } else {
+    uid_candidates <- c(
+      "uid",
+      "unit_id",
+      "unitid",
+      "plant_id",
+      "plantid",
+      "source_id",
+      "sourceid"
+    )
+
+    uid_name <- names(dt)[
+      tolower(names(dt)) %in% uid_candidates
+    ]
+
+    numeric_columns <- names(dt)[
+      vapply(
+        dt,
+        is.numeric,
+        logical(1)
+      )
+    ]
+
+    metadata_columns <- names(dt)[
+      tolower(names(dt)) %in% c(
+        "x", "y", "year", "month",
+        "e", "emiss", "emissions",
+        "so2", "hyads", "rowid",
+        "cell", "cell_id", "cellid"
+      )
+    ]
+
+    value_columns <- setdiff(
+      numeric_columns,
+      c(
+        metadata_columns,
+        uid_name
+      )
+    )
+
+    if (length(uid_name) > 0L) {
+      # Long schema: x, y, uID, and one PM2.5 value column.
+      preferred_value_names <- c(
+        "pm25",
+        "value",
+        "prediction",
+        "pred",
+        "concentration",
+        "conc"
+      )
+
+      preferred_value <- value_columns[
+        tolower(value_columns) %in% preferred_value_names
+      ]
+
+      if (length(preferred_value) == 1L) {
+        value_column <- preferred_value
+      } else if (length(value_columns) == 1L) {
+        value_column <- value_columns
+      } else {
+        stop(
+          "Cannot identify one PM2.5 value column in the long by-unit ",
+          "file for ", year, ". Candidate numeric columns are: ",
+          paste(value_columns, collapse = ", ")
+        )
+      }
+
+      total_dt <- dt[
+        ,
+        .(
+          vals.out = sum(
+            as.numeric(get(value_column)),
+            na.rm = TRUE
+          )
+        ),
+        by = .(x, y)
+      ]
+
+      source_schema <- paste0(
+        "long_byunit:",
+        value_column
+      )
+
+    } else {
+      # Wide schema: x, y, and one numeric column per generating unit.
+      if (length(value_columns) == 0L) {
+        stop(
+          "No numeric unit-level PM2.5 columns were found for ",
+          year, ". Columns are: ",
+          paste(names(dt), collapse = ", ")
+        )
+      }
+
+      dt[
+        ,
+        vals.out := rowSums(
+          .SD,
+          na.rm = TRUE
+        ),
+        .SDcols = value_columns
+      ]
+
+      total_dt <- dt[
+        ,
+        .(
+          vals.out = sum(
+            vals.out,
+            na.rm = TRUE
+          )
+        ),
+        by = .(x, y)
+      ]
+
+      source_schema <- paste0(
+        "wide_byunit:",
+        length(value_columns),
+        "_unit_columns"
+      )
+    }
+  }
+
+  total_dt <- total_dt[
+    is.finite(x) &
+      is.finite(y) &
+      is.finite(vals.out)
+  ]
+
+  if (nrow(total_dt) == 0L) {
+    stop(
+      "No finite grid cells remained after reading ",
+      fst_path
+    )
+  }
+
+  data.table::setorder(
+    total_dt,
+    y,
+    x
+  )
+
+  attr(total_dt, "source_schema") <- source_schema
+  total_dt
+}
+
+make_raster_albers <- function(total_dt) {
+  r <- raster::rasterFromXYZ(
+    total_dt[, .(x, y, vals.out)]
+  )
+  raster::crs(r) <- P4S
+  r
+}
+
+area_weighted_mean_by_polygon <- function(r, polygons_sf) {
+  polygons_sp <- methods::as(
+    polygons_sf,
+    "Spatial"
+  )
+
+  extracted <- raster::extract(
+    r,
+    polygons_sp,
+    weights = TRUE,
+    na.rm = TRUE
+  )
+
+  result <- vapply(
+    extracted,
+    function(x) {
+      if (is.null(x)) {
+        return(NA_real_)
+      }
+
+      if (is.data.frame(x) || is.matrix(x)) {
+        if (nrow(x) == 0L) {
+          return(NA_real_)
+        }
+
+        values <- as.numeric(x[, 1L])
+        weight_names <- c(
+          "weight",
+          "weights",
+          "w",
+          "wt",
+          "frac",
+          "fraction"
+        )
+
+        weight_column <- weight_names[
+          weight_names %in% colnames(x)
+        ][1L]
+
+        if (!is.na(weight_column)) {
+          weights <- as.numeric(
+            x[, weight_column]
+          )
+
+          valid <- is.finite(values) &
+            is.finite(weights) &
+            weights > 0
+
+          if (any(valid)) {
+            return(stats::weighted.mean(
+              values[valid],
+              weights[valid]
+            ))
+          }
+        }
+
+        if (ncol(x) >= 2L) {
+          weights <- as.numeric(x[, 2L])
+          valid <- is.finite(values) &
+            is.finite(weights) &
+            weights > 0
+
+          if (
+            any(valid) &&
+              max(weights[valid], na.rm = TRUE) <= 1.0001
+          ) {
+            return(stats::weighted.mean(
+              values[valid],
+              weights[valid]
+            ))
+          }
+        }
+
+        finite_values <- values[
+          is.finite(values)
+        ]
+
+        if (length(finite_values) == 0L) {
+          return(NA_real_)
+        }
+
+        return(mean(finite_values))
+      }
+
+      if (is.numeric(x)) {
+        finite_values <- x[
+          is.finite(x)
+        ]
+
+        if (length(finite_values) == 0L) {
+          return(NA_real_)
+        }
+
+        return(mean(finite_values))
+      }
+
+      NA_real_
+    },
+    numeric(1)
+  )
+
+  as.numeric(result)
+}
+
+project_and_repair_polygons <- function(polygons_sf, label) {
+  # Older sf installations call lwgeom from st_make_valid(). Hopper does not
+  # have lwgeom, so project first and use the GEOS zero-width-buffer fallback
+  # only when invalid polygon geometries are actually present.
+  polygons_sf <- sf::st_transform(
+    polygons_sf,
+    crs = P4S
+  )
+
+  valid_before <- sf::st_is_valid(polygons_sf)
+  invalid_before <- is.na(valid_before) |
+    !valid_before
+  n_invalid_before <- sum(invalid_before)
+
+  if (n_invalid_before > 0L) {
+    polygons_sf <- suppressWarnings(
+      sf::st_buffer(
+        polygons_sf,
+        dist = 0
+      )
+    )
+  }
+
+  valid_after <- sf::st_is_valid(polygons_sf)
+  invalid_after <- is.na(valid_after) |
+    !valid_after
+  n_invalid_after <- sum(invalid_after)
+
+  if (n_invalid_after > 0L) {
+    stop(
+      label,
+      " geometry repair failed for ",
+      n_invalid_after,
+      " feature(s). Install the R package 'lwgeom' only if this ",
+      "fallback is insufficient."
+    )
+  }
+
+  cat(
+    label,
+    " geometry check: ",
+    n_invalid_before,
+    " invalid before repair; ",
+    n_invalid_after,
+    " invalid after repair.\n",
+    sep = ""
+  )
+
+  polygons_sf
+}
+
+derive_nice_scale <- function(values, probability = 0.99) {
+  values <- as.numeric(values)
+  values <- values[
+    is.finite(values) &
+      values >= 0
+  ]
+
+  if (length(values) == 0L) {
+    stop(
+      "Cannot derive a color scale from an empty value vector."
+    )
+  }
+
+  raw_cap <- as.numeric(
+    stats::quantile(
+      values,
+      probs = probability,
+      na.rm = TRUE,
+      names = FALSE
+    )
+  )
+
+  if (!is.finite(raw_cap) || raw_cap <= 0) {
+    raw_cap <- max(
+      values,
+      na.rm = TRUE
+    )
+  }
+
+  if (!is.finite(raw_cap) || raw_cap <= 0) {
+    stop(
+      "Cannot derive a positive color-scale maximum."
+    )
+  }
+
+  candidate_breaks <- pretty(
+    c(
+      0,
+      raw_cap
+    ),
+    n = 4
+  )
+
+  candidate_breaks <- candidate_breaks[
+    candidate_breaks >= 0
+  ]
+
+  cap <- max(
+    candidate_breaks
+  )
+
+  breaks <- candidate_breaks[
+    candidate_breaks <= cap
+  ]
+
+  if (length(breaks) > 6L) {
+    breaks <- seq(
+      0,
+      cap,
+      length.out = 5L
+    )
+  }
+
+  accuracy <- if (cap < 0.1) {
+    0.01
+  } else if (cap < 1) {
+    0.05
+  } else {
+    0.1
+  }
+
+  display_breaks <- round(
+    breaks / accuracy
+  ) * accuracy
+
+  decimal_places <- max(
+    0L,
+    ceiling(
+      -log10(
+        accuracy
+      )
+    )
+  )
+
+  label_text <- formatC(
+    display_breaks,
+    format = "f",
+    digits = decimal_places
+  )
+
+  # Plotmath reliably renders the final legend label as "greater than or
+  # equal to" on Hopper, whereas a literal Unicode symbol may become dots.
+  label_expression_text <- label_text
+  label_expression_text[
+    length(
+      label_expression_text
+    )
+  ] <- paste0(
+    "phantom(0) >= ",
+    label_text[
+      length(
+        label_text
+      )
+    ]
+  )
+
+  labels <- parse(
+    text = label_expression_text
+  )
+
+  list(
+    cap = cap,
+    breaks = breaks,
+    labels = labels,
+    quantile_value = raw_cap
+  )
+}
+
+theme_publication <- function(base_size = 10) {
+  theme_classic(
+    base_size = base_size,
+    base_family = "sans"
+  ) +
+    theme(
+      text = element_text(
+        color = "black"
+      ),
+      axis.title = element_text(
+        size = base_size,
+        color = "black"
+      ),
+      axis.text = element_text(
+        size = base_size - 1,
+        color = "black"
+      ),
+      axis.ticks = element_line(
+        color = "black",
+        linewidth = 0.35
+      ),
+      axis.ticks.length = unit(
+        0.14,
+        "cm"
+      ),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.45
+      ),
+      panel.grid.major.y = element_line(
+        color = "grey88",
+        linewidth = 0.3
+      ),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(
+        t = 6,
+        r = 6,
+        b = 5,
+        l = 6
+      )
+    )
+}
+
+make_map_panel <- function(
+    map_data,
+    state_data,
+    years,
+    scale_info,
+    panel_title,
+    legend_title,
+    facet_rows,
+    map_colors
+) {
+  plot_data <- map_data[
+    as.integer(
+      as.character(
+        map_data$year
+      )
+    ) %in% years,
+  ]
+
+  plot_data$year <- factor(
+    as.integer(
+      as.character(
+        plot_data$year
+      )
+    ),
+    levels = years,
+    labels = years
+  )
+
+  ggplot() +
+    geom_sf(
+      data = plot_data,
+      aes(
+        fill = pm25
+      ),
+      color = NA,
+      linewidth = 0
+    ) +
+    geom_sf(
+      data = state_data,
+      inherit.aes = FALSE,
+      fill = NA,
+      color = "grey55",
+      linewidth = 0.14
+    ) +
+    facet_wrap(
+      ~year,
+      ncol = 3,
+      nrow = facet_rows
+    ) +
+    scale_fill_gradientn(
+      colors = map_colors,
+      limits = c(
+        0,
+        scale_info$cap
+      ),
+      breaks = scale_info$breaks,
+      labels = scale_info$labels,
+      na.value = map_colors[1],
+      oob = scales::squish,
+      name = legend_title,
+      guide = guide_colorbar(
+        direction = "horizontal",
+        title.position = "top",
+        title.hjust = 0.5,
+        barwidth = unit(
+          4.8,
+          "cm"
+        ),
+        barheight = unit(
+          0.30,
+          "cm"
+        ),
+        ticks = FALSE
+      )
+    ) +
+    coord_sf(
+      datum = NA
+    ) +
+    labs(
+      title = panel_title
+    ) +
+    theme_void(
+      base_size = 10,
+      base_family = "sans"
+    ) +
+    theme(
+      plot.title.position = "plot",
+      plot.title = element_text(
+        family = "sans",
+        face = "bold",
+        size = 10.5,
+        color = "black",
+        hjust = 0,
+        margin = margin(
+          t = 1,
+          r = 0,
+          b = 3,
+          l = 0
+        )
+      ),
+      strip.background = element_rect(
+        fill = "grey95",
+        color = "black",
+        linewidth = 0.4
+      ),
+      strip.text = element_text(
+        size = 9.2,
+        face = "bold",
+        color = "black",
+        margin = margin(
+          t = 2.5,
+          r = 3,
+          b = 2.5,
+          l = 3
+        )
+      ),
+      panel.spacing.x = unit(
+        0.65,
+        "lines"
+      ),
+      panel.spacing.y = unit(
+        0.45,
+        "lines"
+      ),
+      legend.position = "bottom",
+      legend.title = element_text(
+        size = 9,
+        color = "black",
+        margin = margin(
+          b = 1
+        )
+      ),
+      legend.text = element_text(
+        size = 8.2,
+        color = "black"
+      ),
+      legend.margin = margin(
+        t = 0,
+        r = 0,
+        b = 0,
+        l = 0
+      ),
+      legend.box.spacing = unit(
+        0.08,
+        "cm"
+      ),
+      plot.margin = margin(
+        t = 2,
+        r = 8,
+        b = 0,
+        l = 8
+      )
+    )
+}
+
+# ==============================================================================
+# 2. Strict preflight
+# ==============================================================================
+
+cat(
+  "\n============================================================\n",
+  "Figure 3 county workflow: 1940-2020\n",
+  "============================================================\n",
+  sep = ""
+)
+
+input_files <- vapply(
+  YEARS,
+  resolve_pm25_file,
+  character(1)
+)
+
+missing_inputs <- input_files[
+  !file.exists(input_files)
+]
+
+if (length(missing_inputs) > 0L) {
+  stop(
+    "Required PM2.5 files are missing:\n",
+    paste(
+      paste0("  ", missing_inputs),
+      collapse = "\n"
+    )
+  )
+}
+
+if (!file.exists(POP_FILE)) {
+  stop(
+    "Population file not found: ",
+    POP_FILE
+  )
+}
+
+population_header <- names(
+  data.table::fread(
+    POP_FILE,
+    nrows = 0L
+  )
+)
+
+required_population_columns <- c(
+  "STATEFP",
+  "COUNTYFP",
+  paste0("A00AA", YEARS)
+)
+
+missing_population_columns <- setdiff(
+  required_population_columns,
+  population_header
+)
+
+if (length(missing_population_columns) > 0L) {
+  stop(
+    "Population file is missing required columns: ",
+    paste(
+      missing_population_columns,
+      collapse = ", "
+    )
+  )
+}
+
+cat("All nine PM2.5 files and population columns passed preflight.\n\n")
+
+# ==============================================================================
+# 3. County and state geometry
+# ==============================================================================
+
+counties_sf <- USAboundaries::us_counties()
+counties_sf <- counties_sf[
+  ,
+  !duplicated(names(counties_sf))
+]
+
+keep_county_columns <- intersect(
+  c(
+    "geoid",
+    "state_abbr",
+    "stusps",
+    "state_name",
+    "name",
+    "geometry"
+  ),
+  names(counties_sf)
+)
+
+counties_sf <- counties_sf[
+  ,
+  keep_county_columns
+]
+
+if (
+  !("state_abbr" %in% names(counties_sf)) &&
+    "stusps" %in% names(counties_sf)
+) {
+  counties_sf$state_abbr <- counties_sf$stusps
+}
+
+required_county_columns <- c(
+  "geoid",
+  "state_abbr",
+  "state_name",
+  "name"
+)
+
+missing_county_columns <- setdiff(
+  required_county_columns,
+  names(counties_sf)
+)
+
+if (length(missing_county_columns) > 0L) {
+  stop(
+    "County geometry is missing columns: ",
+    paste(
+      missing_county_columns,
+      collapse = ", "
+    )
+  )
+}
+
+counties_sf <- counties_sf[
+  !(counties_sf$state_abbr %in% c(
+    "AK",
+    "HI",
+    "PR"
+  )),
+]
+
+counties_sf$geoid <- fmt_geoid5(
+  counties_sf$geoid
+)
+
+counties_sf <- counties_sf[
+  !duplicated(counties_sf$geoid),
+]
+
+counties_sf <- project_and_repair_polygons(
+  counties_sf,
+  "County"
+)
+
+states_sf <- USAboundaries::us_states()
+
+if (
+  !("state_abbr" %in% names(states_sf)) &&
+    "stusps" %in% names(states_sf)
+) {
+  states_sf$state_abbr <- states_sf$stusps
+}
+
+states_sf <- states_sf[
+  !(states_sf$state_abbr %in% c(
+    "AK",
+    "HI",
+    "PR"
+  )),
+]
+
+states_sf <- project_and_repair_polygons(
+  states_sf,
+  "State"
+)
+
+cat(
+  "CONUS county geometries loaded: ",
+  nrow(counties_sf),
+  "\n",
+  sep = ""
+)
+
+# ==============================================================================
+# 4. Population data: one NHGIS file for all nine years
+# ==============================================================================
+
+population_wide <- data.table::fread(
+  POP_FILE
+)
+
+population_columns <- paste0(
+  "A00AA",
+  YEARS
+)
+
+population_long <- data.table::melt(
+  population_wide[
+    ,
+    c(
+      "STATEFP",
+      "COUNTYFP",
+      population_columns
+    ),
+    with = FALSE
+  ],
+  id.vars = c(
+    "STATEFP",
+    "COUNTYFP"
+  ),
+  variable.name = "population_field",
+  value.name = "population"
+)
+
+population_long[
+  ,
+  year := as.integer(
+    sub(
+      "^A00AA",
+      "",
+      population_field
+    )
+  )
+]
+
+population_long[
+  ,
+  `:=`(
+    statefp_numeric = suppressWarnings(
+      as.integer(
+        trimws(
+          as.character(STATEFP)
+        )
+      )
+    ),
+    countyfp_numeric = suppressWarnings(
+      as.integer(
+        trimws(
+          as.character(COUNTYFP)
+        )
+      )
+    )
+  )
+]
+
+population_long[
+  ,
+  geoid := data.table::fifelse(
+    !is.na(statefp_numeric) &
+      data.table::between(
+        statefp_numeric,
+        1L,
+        99L
+      ) &
+      !is.na(countyfp_numeric) &
+      data.table::between(
+        countyfp_numeric,
+        1L,
+        999L
+      ),
+    sprintf(
+      "%02d%03d",
+      statefp_numeric,
+      countyfp_numeric
+    ),
+    NA_character_
+  )
+]
+
+population_long[
+  ,
+  `:=`(
+    geoid = fmt_geoid5(geoid),
+    population = as.numeric(population)
+  )
+]
+
+population_rows_before_filter <- nrow(
+  population_long[
+    year %in% YEARS
+  ]
+)
+
+population_dt <- population_long[
+  year %in% YEARS &
+    !is.na(geoid) &
+    geoid %in% counties_sf$geoid,
+  .(
+    geoid,
+    year,
+    population
+  )
+]
+
+population_rows_excluded <- (
+  population_rows_before_filter -
+    nrow(population_dt)
+)
+
+# Remove only byte-for-byte duplicate observations. Conflicting population
+# values for the same valid CONUS county-year remain visible to the check below.
+population_dt <- unique(
+  population_dt,
+  by = c(
+    "geoid",
+    "year",
+    "population"
+  )
+)
+
+duplicate_population <- population_dt[
+  ,
+  .N,
+  by = .(
+    geoid,
+    year
+  )
+][N > 1L]
+
+if (nrow(duplicate_population) > 0L) {
+  stop(
+    "Population file has conflicting duplicate valid CONUS county-year rows. ",
+    "First duplicated keys: ",
+    paste(
+      head(
+        paste0(
+          duplicate_population$geoid,
+          "-",
+          duplicate_population$year
+        ),
+        10L
+      ),
+      collapse = ", "
+    )
+  )
+}
+
+population_qa <- data.table::data.table(
+  metric = c(
+    "raw_requested_year_rows",
+    "excluded_invalid_or_non_conus_rows",
+    "retained_unique_conus_county_year_rows",
+    "retained_unique_counties",
+    "retained_unique_years"
+  ),
+  value = c(
+    population_rows_before_filter,
+    population_rows_excluded,
+    nrow(population_dt),
+    data.table::uniqueN(population_dt$geoid),
+    data.table::uniqueN(population_dt$year)
+  )
+)
+
+data.table::fwrite(
+  population_qa,
+  file.path(
+    QA_DIR,
+    "Figure_3_population_input_QA_1940_2020.csv"
+  )
+)
+
+cat(
+  "Population rows retained: ",
+  nrow(population_dt),
+  " | invalid/non-CONUS rows excluded: ",
+  population_rows_excluded,
+  " | counties: ",
+  data.table::uniqueN(population_dt$geoid),
+  "\n",
+  sep = ""
+)
+
+# ==============================================================================
+# 5. Grid totals, county aggregation, and national PWE
+# ==============================================================================
+
+county_results <- vector(
+  "list",
+  length(YEARS)
+)
+
+national_results <- vector(
+  "list",
+  length(YEARS)
+)
+
+qa_results <- vector(
+  "list",
+  length(YEARS)
+)
+
+county_attributes <- sf::st_drop_geometry(
+  counties_sf
+)
+
+for (year_index in seq_along(YEARS)) {
+  year <- YEARS[year_index]
+  current_year <- year
+  input_file <- input_files[year_index]
+
+  cat(
+    "\n========== Processing ",
+    year,
+    " ==========\n",
+    sep = ""
+  )
+  cat(
+    "Input: ",
+    input_file,
+    "\n",
+    sep = ""
+  )
+
+  total_grid <- derive_total_grid(
+    input_file,
+    year
+  )
+
+  source_schema <- attr(
+    total_grid,
+    "source_schema"
+  )
+
+  if (year %in% MODERN_YEARS) {
+    derived_file <- file.path(
+      DERIVED_TOTAL_DIR,
+      sprintf(
+        "grids_pm25_total_%d.fst",
+        year
+      )
+    )
+
+    fst::write_fst(
+      total_grid,
+      derived_file,
+      compress = 50
+    )
+
+    cat(
+      "Derived modern total: ",
+      derived_file,
+      "\n",
+      sep = ""
+    )
+  }
+
+  grid_raster <- make_raster_albers(
+    total_grid
+  )
+
+  raster_min <- raster::cellStats(
+    grid_raster,
+    stat = "min",
+    na.rm = TRUE
+  )
+
+  raster_max <- raster::cellStats(
+    grid_raster,
+    stat = "max",
+    na.rm = TRUE
+  )
+
+  cat(
+    "Grid schema: ",
+    source_schema,
+    "\n",
+    sep = ""
+  )
+
+  cat(
+    "Grid cells: ",
+    nrow(total_grid),
+    " | min/max: ",
+    signif(raster_min, 6),
+    " / ",
+    signif(raster_max, 6),
+    "\n",
+    sep = ""
+  )
+
+  cat(
+    "Extracting area-weighted county means...\n"
+  )
+
+  county_pm25 <- area_weighted_mean_by_polygon(
+    grid_raster,
+    counties_sf
+  )
+
+  county_year <- data.table(
+    geoid = fmt_geoid5(
+      county_attributes$geoid
+    ),
+    state_abbr = as.character(
+      county_attributes$state_abbr
+    ),
+    state_name = as.character(
+      county_attributes$state_name
+    ),
+    county_name = as.character(
+      county_attributes$name
+    ),
+    year = year,
+    pm25 = as.numeric(
+      county_pm25
+    )
+  )
+
+  county_year <- merge(
+    county_year,
+    population_dt[
+      year == current_year
+    ],
+    by = c(
+      "geoid",
+      "year"
+    ),
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  valid_for_pwe <- county_year[
+    is.finite(pm25) &
+      is.finite(population) &
+      population > 0
+  ]
+
+  if (nrow(valid_for_pwe) == 0L) {
+    stop(
+      "No valid county population and PM2.5 rows for ",
+      year
+    )
+  }
+
+  national_population <- valid_for_pwe[
+    ,
+    sum(
+      population,
+      na.rm = TRUE
+    )
+  ]
+
+  national_pwe <- valid_for_pwe[
+    ,
+    sum(
+      pm25 * population,
+      na.rm = TRUE
+    ) / national_population
+  ]
+
+  county_year[
+    ,
+    `:=`(
+      burden = fifelse(
+        is.finite(pm25) &
+          is.finite(population) &
+          population > 0,
+        pm25 * population,
+        NA_real_
+      ),
+      contribution_to_national_pwe = fifelse(
+        is.finite(pm25) &
+          is.finite(population) &
+          population > 0,
+        pm25 * population /
+          national_population,
+        NA_real_
+      )
+    )
+  ]
+
+  population_all_conus <- population_dt[
+    year == current_year &
+      geoid %in% counties_sf$geoid &
+      is.finite(population) &
+      population > 0,
+    sum(population)
+  ]
+
+  population_coverage <- if (
+    is.finite(population_all_conus) &&
+      population_all_conus > 0
+  ) {
+    national_population /
+      population_all_conus
+  } else {
+    NA_real_
+  }
+
+  county_file <- file.path(
+    TABLE_DIR,
+    sprintf(
+      "county_pm25_pop_%d.csv",
+      year
+    )
+  )
+
+  data.table::fwrite(
+    county_year,
+    county_file
+  )
+
+  county_results[[year_index]] <- county_year
+
+  national_results[[year_index]] <- data.table(
+    year = year,
+    PWE = national_pwe,
+    population_used = national_population,
+    population_coverage_fraction = population_coverage,
+    n_counties_used = nrow(valid_for_pwe)
+  )
+
+  qa_results[[year_index]] <- data.table(
+    year = year,
+    input_file = input_file,
+    source_schema = source_schema,
+    n_grid_cells = nrow(total_grid),
+    grid_min_pm25 = raster_min,
+    grid_max_pm25 = raster_max,
+    n_counties_total = nrow(county_year),
+    n_counties_with_pm25 = county_year[
+      is.finite(pm25),
+      .N
+    ],
+    n_counties_used_for_pwe = nrow(valid_for_pwe),
+    county_pm25_missing_fraction = mean(
+      !is.finite(county_year$pm25)
+    ),
+    population_coverage_fraction = population_coverage,
+    national_PWE = national_pwe
+  )
+
+  cat(
+    "Counties used for PWE: ",
+    nrow(valid_for_pwe),
+    " | population coverage: ",
+    sprintf(
+      "%.3f%%",
+      100 * population_coverage
+    ),
+    "\n",
+    sep = ""
+  )
+
+  cat(
+    "National PWE: ",
+    signif(
+      national_pwe,
+      8
+    ),
+    " ug/m3\n",
+    sep = ""
+  )
+
+  rm(
+    total_grid,
+    grid_raster,
+    county_pm25,
+    valid_for_pwe
+  )
+  gc()
+}
+
+county_all <- data.table::rbindlist(
+  county_results,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+national_pwe <- data.table::rbindlist(
+  national_results,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+year_qa <- data.table::rbindlist(
+  qa_results,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+data.table::setorder(
+  county_all,
+  year,
+  geoid
+)
+
+data.table::setorder(
+  national_pwe,
+  year
+)
+
+data.table::setorder(
+  year_qa,
+  year
+)
+
+data.table::fwrite(
+  county_all,
+  file.path(
+    TABLE_DIR,
+    "county_pm25_pop_all_years_1940_2020.csv"
+  )
+)
+
+data.table::fwrite(
+  national_pwe,
+  file.path(
+    TABLE_DIR,
+    "national_PWE_1940_2020.csv"
+  )
+)
+
+data.table::fwrite(
+  year_qa,
+  file.path(
+    QA_DIR,
+    "Figure_3_year_QA_1940_2020.csv"
+  )
+)
+
+# ==============================================================================
+# 6. Plot data
+# ==============================================================================
+
+# Complete county-year panel for the maps. Missing map values are displayed at
+# zero only to avoid white holes; they are never used as zeros in the PWE math.
+map_panel <- data.table::CJ(
+  geoid = unique(
+    counties_sf$geoid
+  ),
+  year = YEARS,
+  unique = TRUE
+)
+
+map_panel <- merge(
+  map_panel,
+  county_all[
+    ,
+    .(
+      geoid,
+      year,
+      pm25
+    )
+  ],
+  by = c(
+    "geoid",
+    "year"
+  ),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+map_panel[
+  !is.finite(pm25),
+  pm25 := 0
+]
+
+map_panel[
+  ,
+  year := factor(
+    year,
+    levels = YEARS,
+    labels = YEARS
+  )
+]
+
+map_sf <- merge(
+  counties_sf,
+  as.data.frame(
+    map_panel
+  ),
+  by = "geoid",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+map_sf$year <- factor(
+  map_sf$year,
+  levels = as.character(YEARS),
+  labels = YEARS
+)
+
+historical_scale <- derive_nice_scale(
+  county_all[
+    year %in% HISTORICAL_YEARS,
+    pm25
+  ],
+  MAP_CAP_QUANTILE
+)
+
+modern_scale <- derive_nice_scale(
+  county_all[
+    year %in% MODERN_YEARS,
+    pm25
+  ],
+  MAP_CAP_QUANTILE
+)
+
+cat(
+  "Historical map scale: 0 to ",
+  historical_scale$cap,
+  " ug/m3; raw 99th percentile = ",
+  signif(
+    historical_scale$quantile_value,
+    5
+  ),
+  "\n",
+  sep = ""
+)
+
+cat(
+  "Modern map scale: 0 to ",
+  modern_scale$cap,
+  " ug/m3; raw 99th percentile = ",
+  signif(
+    modern_scale$quantile_value,
+    5
+  ),
+  "\n",
+  sep = ""
+)
+
+boxplot_data <- county_all[
+  is.finite(pm25),
+  .(
+    year = factor(
+      year,
+      levels = YEARS,
+      labels = YEARS
+    ),
+    pm25
+  )
+]
+
+pwe_plot_data <- copy(
+  national_pwe
+)
+
+# ==============================================================================
+# 7. Panels (a) and (b): split-period county maps
+# ==============================================================================
+
+panel_a <- make_map_panel(
+  map_data = map_sf,
+  state_data = states_sf,
+  years = HISTORICAL_YEARS,
+  scale_info = historical_scale,
+  panel_title = "(a)",
+  legend_title = expression(
+    "Historical coal PM"[2.5] *
+      " (" *
+      mu * "g " * m^{-3} *
+      ")"
+  ),
+  facet_rows = 2,
+  map_colors = HISTORICAL_MAP_COLORS
+)
+
+panel_b <- make_map_panel(
+  map_data = map_sf,
+  state_data = states_sf,
+  years = MODERN_YEARS,
+  scale_info = modern_scale,
+  panel_title = "(b)",
+  legend_title = expression(
+    "Modern coal PM"[2.5] *
+      " (" *
+      mu * "g " * m^{-3} *
+      ")"
+  ),
+  facet_rows = 1,
+  map_colors = MODERN_MAP_COLORS
+)
+
+# ==============================================================================
+# 8. Panel (c): county-level concentration distributions
+# ==============================================================================
+
+panel_c <- ggplot(
+  boxplot_data,
+  aes(
+    x = year,
+    y = pm25,
+    group = year
+  )
+) +
+  geom_boxplot(
+    width = 0.62,
+    linewidth = 0.55,
+    color = "black",
+    fill = "grey90",
+    outlier.shape = 16,
+    outlier.size = 0.55,
+    outlier.alpha = 0.40
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(
+      accuracy = 0.1,
+      trim = TRUE
+    ),
+    expand = expansion(
+      mult = c(
+        0.02,
+        0.07
+      )
+    )
+  ) +
+  labs(
+    tag = "(c)",
+    x = "Year",
+    y = expression(
+      "County-mean coal PM"[2.5] *
+        " (" *
+        mu * "g " * m^{-3} *
+        ")"
+    )
+  ) +
+  theme_publication(
+    base_size = 10
+  ) +
+  theme(
+    plot.tag = element_text(
+      family = "sans",
+      face = "bold",
+      size = 11,
+      color = "black"
+    ),
+    plot.tag.position = c(
+      0.025,
+      0.975
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    plot.margin = margin(
+      t = 10,
+      r = 6,
+      b = 5,
+      l = 10
+    )
+  )
+
+# ==============================================================================
+# 9. Panel (d): national population-weighted exposure
+# ==============================================================================
+
+panel_d <- ggplot(
+  pwe_plot_data,
+  aes(
+    x = year,
+    y = PWE
+  )
+) +
+  geom_line(
+    aes(
+      group = 1
+    ),
+    color = "#0072B2",
+    linewidth = 1
+  ) +
+  geom_point(
+    color = "#0072B2",
+    fill = "white",
+    shape = 21,
+    size = 2.5,
+    stroke = 0.8
+  ) +
+  scale_x_continuous(
+    breaks = YEARS,
+    limits = c(
+      1938,
+      2022
+    ),
+    expand = expansion(
+      mult = c(
+        0,
+        0
+      )
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(
+      accuracy = 0.01,
+      trim = TRUE
+    ),
+    expand = expansion(
+      mult = c(
+        0.03,
+        0.08
+      )
+    )
+  ) +
+  labs(
+    tag = "(d)",
+    x = "Year",
+    y = expression(
+      "Population-weighted exposure" ~
+        "(" *
+        mu * "g " * m^{-3} *
+        ")"
+    )
+  ) +
+  theme_publication(
+    base_size = 10
+  ) +
+  theme(
+    plot.tag = element_text(
+      family = "sans",
+      face = "bold",
+      size = 11,
+      color = "black"
+    ),
+    plot.tag.position = c(
+      0.025,
+      0.975
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    plot.margin = margin(
+      t = 10,
+      r = 10,
+      b = 5,
+      l = 6
+    )
+  )
+
+# ==============================================================================
+# 10. Combine and save Figure 3
+# ==============================================================================
+
+map_stack <- gridExtra::arrangeGrob(
+  panel_a,
+  panel_b,
+  ncol = 1,
+  heights = c(
+    1.55,
+    1
+  )
+)
+
+bottom_row <- gridExtra::arrangeGrob(
+  panel_c,
+  grid::nullGrob(),
+  panel_d,
+  ncol = 3,
+  widths = c(
+    1,
+    0.09,
+    1
+  )
+)
+
+figure3_combined <- gridExtra::arrangeGrob(
+  map_stack,
+  bottom_row,
+  ncol = 1,
+  heights = c(
+    2.35,
+    1
+  ),
+  padding = unit(
+    0.12,
+    "cm"
+  )
+)
+
+pdf_file <- file.path(
+  FIG_DIR,
+  "Figure_3_coal_PM25_exposure_1940_2020_split_scales.pdf"
+)
+
+tiff_file <- file.path(
+  FIG_DIR,
+  "Figure_3_coal_PM25_exposure_1940_2020_split_scales.tiff"
+)
+
+if (file.exists(pdf_file)) {
+  file.remove(pdf_file)
+}
+
+if (file.exists(tiff_file)) {
+  file.remove(tiff_file)
+}
+
+grDevices::pdf(
+  file = pdf_file,
+  width = FIGURE_WIDTH,
+  height = FIGURE_HEIGHT,
+  onefile = TRUE,
+  useDingbats = FALSE,
+  paper = "special",
+  bg = "white"
+)
+
+grid::grid.newpage()
+grid::grid.draw(
+  figure3_combined
+)
+invisible(
+  grDevices::dev.off()
+)
+
+pdf_saved <- file.exists(
+  pdf_file
+)
+
+tiff_saved <- FALSE
+
+if (capabilities("cairo")) {
+  grDevices::tiff(
+    filename = tiff_file,
+    width = FIGURE_WIDTH,
+    height = FIGURE_HEIGHT,
+    units = "in",
+    res = 600,
+    compression = "lzw",
+    type = "cairo",
+    bg = "white"
+  )
+
+  grid::grid.newpage()
+  grid::grid.draw(
+    figure3_combined
+  )
+  invisible(
+    grDevices::dev.off()
+  )
+
+  tiff_saved <- file.exists(
+    tiff_file
+  )
+}
+
+if (
+  !tiff_saved &&
+    requireNamespace(
+      "Cairo",
+      quietly = TRUE
+    )
+) {
+  Cairo::CairoTIFF(
+    filename = tiff_file,
+    width = FIGURE_WIDTH,
+    height = FIGURE_HEIGHT,
+    units = "in",
+    dpi = 600,
+    compression = "lzw",
+    bg = "white"
+  )
+
+  grid::grid.newpage()
+  grid::grid.draw(
+    figure3_combined
+  )
+  invisible(
+    grDevices::dev.off()
+  )
+
+  tiff_saved <- file.exists(
+    tiff_file
+  )
+}
+
+if (!pdf_saved) {
+  stop(
+    "The Figure 3 PDF was not created: ",
+    pdf_file
+  )
+}
+
+if (!tiff_saved) {
+  warning(
+    "The PDF was created, but no compatible Cairo TIFF device was available.",
+    call. = FALSE
+  )
+}
+
+run_complete_file <- file.path(
+  OUT_DIR,
+  "RUN_COMPLETE_Figure_3_1940_2020.txt"
+)
+
+writeLines(
+  c(
+    "Figure 3 county workflow completed successfully.",
+    paste0(
+      "Completed: ",
+      format(
+        Sys.time(),
+        "%Y-%m-%d %H:%M:%S %Z"
+      )
+    ),
+    paste0(
+      "Years: ",
+      paste(
+        YEARS,
+        collapse = ", "
+      )
+    ),
+    paste0(
+      "PDF: ",
+      pdf_file
+    ),
+    paste0(
+      "TIFF created: ",
+      tiff_saved
+    ),
+    paste0(
+      "National PWE table: ",
+      file.path(
+        TABLE_DIR,
+        "national_PWE_1940_2020.csv"
+      )
+    ),
+    paste0(
+      "QA table: ",
+      file.path(
+        QA_DIR,
+        "Figure_3_year_QA_1940_2020.csv"
+      )
+    )
+  ),
+  run_complete_file
+)
+
+cat(
+  "\n============================================================\n",
+  "FIGURE 3 COMPLETED\n",
+  "============================================================\n",
+  "PDF: ",
+  pdf_file,
+  "\nTIFF created: ",
+  tiff_saved,
+  "\nNational PWE table: ",
+  file.path(
+    TABLE_DIR,
+    "national_PWE_1940_2020.csv"
+  ),
+  "\nQA table: ",
+  file.path(
+    QA_DIR,
+    "Figure_3_year_QA_1940_2020.csv"
+  ),
+  "\n",
+  sep = ""
+)
