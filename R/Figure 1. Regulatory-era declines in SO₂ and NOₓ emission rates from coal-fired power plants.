@@ -1,10 +1,14 @@
-# ================================================================
-# Figure 1
-# Declines in SO2 and NOx emission rates from coal-fired units
+# ==============================================================================
+# Figure 1. Evaluation of facility-level emission-factor models
 #
-# (a) Annual heat-input-weighted emission rates
-# (b) Rates stratified by reported pollutant-specific control status
-# ================================================================
+# Panels (a) and (b): independent-holdout observed versus predicted EFs.
+# Panels (c) and (d): annual CAMPD-reported versus XGBoost-reconstructed
+#                     emissions in independent-holdout facilities, 1997-2020.
+#
+# Required inputs:
+#   TableS4_holdout_predictions.csv
+#   annual-emissions-facility-aggregation-1995-2020-CAMPD.csv
+# ==============================================================================
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -13,635 +17,643 @@ suppressPackageStartupMessages({
   library(scales)
 })
 
-if (!requireNamespace("patchwork", quietly = TRUE)) {
-  install.packages("patchwork")
-}
-
-# ================================================================
+# ==============================================================================
 # 0. File paths
-# ================================================================
+#
+# Usage on Hopper:
+#   Rscript Figure_1_model_evaluation.R MODEL_DIR OUTPUT_DIR
+#
+# MODEL_DIR must contain TableS4_holdout_predictions.csv. The CAMPD facility
+# file is read from MODEL_DIR/../data unless supplied as a third argument.
+# ==============================================================================
 
-data_dir <- paste0(
-  "/Users/xshan2/OneDrive - George Mason University - O365 Production/",
-  "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/",
-  "PowerPlant/EF_pp_paper_code/data"
+args <- commandArgs(trailingOnly = TRUE)
+
+default_model_dir <- paste0(
+  "/Users/xshan2/Library/CloudStorage/",
+  "OneDrive-GeorgeMasonUniversity-O365Production/",
+  "GMU_PhD/01_Research/03_powerplant/data/",
+  "TableS4_facility_level_rebuild"
 )
 
-input_file <- file.path(
-  data_dir,
-  "annual-emissions-unit-1996-2020-CAMPD.csv"
-)
-
-output_dir <- paste0(
+default_output_dir <- paste0(
   "/Users/xshan2/Library/CloudStorage/",
   "OneDrive-GeorgeMasonUniversity-O365Production/",
   "GMU_PhD/01_Research/03_powerplant/Figure_plot"
 )
 
-if (!dir.exists(output_dir)) {
-  dir.create(
-    output_dir,
-    recursive = TRUE
+model_dir <- if (length(args) >= 1L) {
+  args[1L]
+} else {
+  default_model_dir
+}
+
+holdout_file <- file.path(
+  model_dir,
+  "TableS4_holdout_predictions.csv"
+)
+
+output_dir <- if (length(args) >= 2L) {
+  args[2L]
+} else {
+  default_output_dir
+}
+
+campd_file <- if (length(args) >= 3L) {
+  args[3L]
+} else {
+  file.path(
+    dirname(model_dir),
+    "data",
+    "annual-emissions-facility-aggregation-1995-2020-CAMPD.csv"
   )
 }
 
-# ================================================================
-# 1. Read unit-level CAMPD data
-# ================================================================
+if (!dir.exists(model_dir)) {
+  stop("Model output directory does not exist: ", model_dir)
+}
 
-unit_emission <- read.csv(
-  input_file,
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+required_files <- c(holdout_file, campd_file)
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0L) {
+  stop(
+    "Missing required model output(s):\n",
+    paste(missing_files, collapse = "\n"),
+    "\nExpected the holdout predictions and facility-level CAMPD data."
+  )
+}
+
+# ==============================================================================
+# 1. Read and validate inputs
+# ==============================================================================
+
+holdout <- read.csv(
+  holdout_file,
   stringsAsFactors = FALSE,
-  check.names = TRUE
+  check.names = FALSE
 )
 
-required_columns <- c(
-  "Facility.ID",
-  "Unit.ID",
+campd <- read.csv(
+  campd_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+required_holdout <- c(
+  "pollutant",
+  "facility_id",
   "Year",
-  "Primary.Fuel.Type",
-  "SO2.Mass..short.tons.",
-  "NOx.Mass..short.tons.",
-  "Heat.Input..mmBtu.",
-  "SO2.Controls",
-  "NOx.Controls"
+  "observed_EF_g_per_kWh",
+  "predicted_EF_g_per_kWh"
 )
 
-missing_columns <- setdiff(
-  required_columns,
-  names(unit_emission)
-)
+missing_holdout <- setdiff(required_holdout, names(holdout))
 
-if (length(missing_columns) > 0) {
+if (length(missing_holdout) > 0L) {
   stop(
-    "Missing required columns: ",
-    paste(missing_columns, collapse = ", ")
+    "Holdout file is missing column(s): ",
+    paste(missing_holdout, collapse = ", ")
   )
 }
 
-# Confirm unique unit-year records
-duplicate_keys <- unit_emission %>%
-  count(
-    Facility.ID,
-    Unit.ID,
-    Year,
-    name = "n"
-  ) %>%
-  filter(n > 1)
-
-if (nrow(duplicate_keys) > 0) {
-  stop(
-    "Duplicate Facility.ID–Unit.ID–Year records detected."
-  )
+standardize_pollutant <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  ifelse(x == "NOX", "NOx", ifelse(x == "SO2", "SO2", x))
 }
 
-# ================================================================
-# 2. Prepare coal-fired unit data
-# ================================================================
+normalize_name <- function(x) {
+  tolower(gsub("[^a-z0-9]", "", x))
+}
 
-coal_units <- unit_emission %>%
-  mutate(
-    Year = as.integer(Year),
-    
-    SO2_tons = as.numeric(
-      SO2.Mass..short.tons.
-    ),
-    
-    NOx_tons = as.numeric(
-      NOx.Mass..short.tons.
-    ),
-    
-    heat_input_MMBtu = as.numeric(
-      Heat.Input..mmBtu.
+pick_column <- function(column_names, candidates, label) {
+  hit <- match(normalize_name(candidates), normalize_name(column_names))
+  hit <- hit[!is.na(hit)]
+  if (length(hit) == 0L) {
+    stop(
+      "Could not identify ", label, " in CAMPD file. Available columns: ",
+      paste(column_names, collapse = ", ")
     )
+  }
+  column_names[hit[1L]]
+}
+
+holdout <- holdout %>%
+  transmute(
+    pollutant = standardize_pollutant(pollutant),
+    facility_id = as.character(facility_id),
+    Year = as.integer(Year),
+    observed_EF_g_per_kWh = as.numeric(observed_EF_g_per_kWh),
+    predicted_EF_g_per_kWh = as.numeric(predicted_EF_g_per_kWh)
   ) %>%
   filter(
-    Year >= 1996,
+    pollutant %in% c("SO2", "NOx"),
+    is.finite(observed_EF_g_per_kWh),
+    is.finite(predicted_EF_g_per_kWh),
+    observed_EF_g_per_kWh >= 0,
+    predicted_EF_g_per_kWh >= 0
+  )
+
+if (nrow(holdout) == 0L) {
+  stop("No usable independent-holdout predictions were found.")
+}
+
+campd_facility_column <- pick_column(
+  names(campd),
+  c("Facility.ID", "Facility ID", "facility_id", "ORISPL_CODE"),
+  "facility identifier"
+)
+
+campd_year_column <- pick_column(
+  names(campd),
+  c("Year", "year"),
+  "year"
+)
+
+campd_generation_column <- pick_column(
+  names(campd),
+  c("Gross.Load..MWh.", "Gross Load (MWh)", "Gross.Load.MWh"),
+  "gross generation"
+)
+
+campd_key <- campd %>%
+  transmute(
+    facility_id = as.character(.data[[campd_facility_column]]),
+    Year = as.integer(.data[[campd_year_column]]),
+    gross_generation_kWh =
+      as.numeric(.data[[campd_generation_column]]) * 1000
+  )
+
+duplicate_campd_keys <- campd_key %>%
+  count(facility_id, Year, name = "n") %>%
+  filter(n > 1)
+
+if (nrow(duplicate_campd_keys) > 0L) {
+  stop("CAMPD facility file contains duplicate facility-year records.")
+}
+
+grams_per_short_ton <- 907184.74
+
+modern <- holdout %>%
+  inner_join(campd_key, by = c("facility_id", "Year")) %>%
+  mutate(
+    observed_emissions_short_tons =
+      observed_EF_g_per_kWh * gross_generation_kWh /
+      grams_per_short_ton,
+    predicted_emissions_short_tons =
+      predicted_EF_g_per_kWh * gross_generation_kWh /
+      grams_per_short_ton
+  ) %>%
+  filter(
+    Year >= 1997,
     Year <= 2020,
-    grepl(
-      "coal",
-      Primary.Fuel.Type,
-      ignore.case = TRUE
-    ),
-    is.finite(heat_input_MMBtu),
-    heat_input_MMBtu > 0
+    is.finite(gross_generation_kWh),
+    gross_generation_kWh > 0,
+    is.finite(observed_emissions_short_tons),
+    is.finite(predicted_emissions_short_tons)
   )
 
-if (nrow(coal_units) == 0) {
+if (nrow(modern) == 0L) {
   stop(
-    "No coal-fired unit observations were identified."
+    "No holdout predictions matched the CAMPD facility-year data for 1997-2020."
   )
 }
 
-# ================================================================
-# 3. Define reported control status
-# ================================================================
+# ==============================================================================
+# 2. Independent-holdout metrics
+# ==============================================================================
 
-# A nonmissing, nonblank control entry is treated as reported
-# pollutant-specific control information.
-#
-# Common explicit no-control entries are classified as no control.
+calculate_metrics <- function(observed, predicted) {
+  keep <- is.finite(observed) & is.finite(predicted)
+  observed <- observed[keep]
+  predicted <- predicted[keep]
 
-has_reported_control <- function(x) {
-  
-  x_clean <- trimws(
-    tolower(
-      as.character(x)
-    )
-  )
-  
-  no_control_values <- c(
-    "",
-    "none",
-    "no control",
-    "no controls",
-    "not applicable",
-    "n/a",
-    "na",
-    "unknown"
-  )
-  
-  !is.na(x_clean) &
-    !(x_clean %in% no_control_values)
-}
-
-coal_units <- coal_units %>%
-  mutate(
-    SO2_control_status = if_else(
-      has_reported_control(SO2.Controls),
-      "Reported pollutant-specific control",
-      "No reported pollutant-specific control"
-    ),
-    
-    NOx_control_status = if_else(
-      has_reported_control(NOx.Controls),
-      "Reported pollutant-specific control",
-      "No reported pollutant-specific control"
-    )
-  )
-
-control_levels <- c(
-  "No reported pollutant-specific control",
-  "Reported pollutant-specific control"
-)
-
-# ================================================================
-# 4. Helper for heat-input-weighted emission rates
-# ================================================================
-
-calculate_weighted_rate <- function(
-    data,
-    mass_column
-) {
-  
-  mass_values <- data[[mass_column]]
-  heat_values <- data$heat_input_MMBtu
-  
-  valid <- (
-    is.finite(mass_values) &
-      mass_values >= 0 &
-      is.finite(heat_values) &
-      heat_values > 0
-  )
-  
-  if (!any(valid)) {
-    return(NA_real_)
+  if (length(observed) < 2L) {
+    stop("At least two observations are required to calculate metrics.")
   }
-  
-  # short tons × 2,000 = pounds
-  sum(
-    mass_values[valid] * 2000,
-    na.rm = TRUE
-  ) /
-    sum(
-      heat_values[valid],
-      na.rm = TRUE
-    )
+
+  ss_total <- sum((observed - mean(observed))^2)
+  observed_sum <- sum(observed)
+
+  data.frame(
+    n = length(observed),
+    predictive_R2 = if (ss_total > 0) {
+      1 - sum((predicted - observed)^2) / ss_total
+    } else {
+      NA_real_
+    },
+    NME = if (observed_sum > 0) {
+      sum(abs(predicted - observed)) / observed_sum
+    } else {
+      NA_real_
+    },
+    NMB = if (observed_sum > 0) {
+      sum(predicted - observed) / observed_sum
+    } else {
+      NA_real_
+    },
+    MAE_g_per_kWh = mean(abs(predicted - observed)),
+    RMSE_g_per_kWh = sqrt(mean((predicted - observed)^2)),
+    mean_bias_g_per_kWh = mean(predicted - observed)
+  )
 }
 
-# ================================================================
-# 5. Panel (a): overall annual emission rates
-# ================================================================
-
-overall_SO2 <- coal_units %>%
-  group_by(Year) %>%
-  summarise(
-    emission_rate = calculate_weighted_rate(
-      pick(everything()),
-      "SO2_tons"
-    ),
-    n_units = n_distinct(
-      paste(Facility.ID, Unit.ID)
-    ),
-    .groups = "drop"
+holdout_metrics <- holdout %>%
+  group_by(pollutant) %>%
+  group_modify(
+    ~calculate_metrics(
+      .x$observed_EF_g_per_kWh,
+      .x$predicted_EF_g_per_kWh
+    )
   ) %>%
-  mutate(
-    pollutant = "SO[2]"
-  )
+  ungroup()
 
-overall_NOx <- coal_units %>%
-  group_by(Year) %>%
-  summarise(
-    emission_rate = calculate_weighted_rate(
-      pick(everything()),
-      "NOx_tons"
-    ),
-    n_units = n_distinct(
-      paste(Facility.ID, Unit.ID)
-    ),
-    .groups = "drop"
-  ) %>%
+metric_labels <- holdout_metrics %>%
   mutate(
-    pollutant = "NO[x]"
-  )
-
-panel_a_data <- bind_rows(
-  overall_NOx,
-  overall_SO2
-) %>%
-  mutate(
-    pollutant = factor(
-      pollutant,
-      levels = c("NO[x]", "SO[2]")
+    label = paste0(
+      "R² = ", sprintf("%.3f", predictive_R2),
+      "\nNME = ", sprintf("%.1f%%", 100 * NME),
+      "\nNMB = ", sprintf("%+.1f%%", 100 * NMB)
     )
   )
 
-# ================================================================
-# 6. Panel (b): rates by pollutant-specific control status
-# ================================================================
+# ==============================================================================
+# 3. Annual observed and reconstructed emissions
+# ==============================================================================
 
-controlled_SO2 <- coal_units %>%
-  group_by(
-    Year,
-    control_status = SO2_control_status
-  ) %>%
+annual_emissions <- modern %>%
+  group_by(pollutant, Year) %>%
   summarise(
-    emission_rate = calculate_weighted_rate(
-      pick(everything()),
-      "SO2_tons"
+    observed_emissions_short_tons = sum(
+      observed_emissions_short_tons,
+      na.rm = TRUE
     ),
-    n_units = n_distinct(
-      paste(Facility.ID, Unit.ID)
+    predicted_emissions_short_tons = sum(
+      predicted_emissions_short_tons,
+      na.rm = TRUE
     ),
+    observed_generation_weighted_EF_g_per_kWh =
+      weighted.mean(
+        observed_EF_g_per_kWh,
+        gross_generation_kWh,
+        na.rm = TRUE
+      ),
+    predicted_generation_weighted_EF_g_per_kWh =
+      weighted.mean(
+        predicted_EF_g_per_kWh,
+        gross_generation_kWh,
+        na.rm = TRUE
+      ),
+    n_facilities = n_distinct(facility_id),
     .groups = "drop"
-  ) %>%
-  mutate(
-    pollutant = "SO[2]"
   )
 
-controlled_NOx <- coal_units %>%
-  group_by(
+annual_long <- annual_emissions %>%
+  select(
+    pollutant,
     Year,
-    control_status = NOx_control_status
+    CAMPD = observed_emissions_short_tons,
+    XGBoost = predicted_emissions_short_tons
   ) %>%
-  summarise(
-    emission_rate = calculate_weighted_rate(
-      pick(everything()),
-      "NOx_tons"
-    ),
-    n_units = n_distinct(
-      paste(Facility.ID, Unit.ID)
-    ),
-    .groups = "drop"
+  pivot_longer(
+    cols = c(CAMPD, XGBoost),
+    names_to = "series",
+    values_to = "emissions_short_tons"
   ) %>%
   mutate(
-    pollutant = "NO[x]"
+    series = factor(series, levels = c("CAMPD", "XGBoost")),
+    emissions_million_short_tons = emissions_short_tons / 1e6
   )
 
-panel_b_data <- bind_rows(
-  controlled_NOx,
-  controlled_SO2
-) %>%
-  mutate(
-    pollutant = factor(
-      pollutant,
-      levels = c("NO[x]", "SO[2]")
-    ),
-    
-    control_status = factor(
-      control_status,
-      levels = control_levels
-    )
-  )
-
-# ================================================================
-# 7. Save aggregated plotting data
-# ================================================================
+# ==============================================================================
+# 4. Save data used in Figure 1
+# ==============================================================================
 
 write.csv(
-  panel_a_data,
-  file.path(
-    output_dir,
-    "Figure_2a_overall_emission_rates.csv"
-  ),
+  holdout_metrics,
+  file.path(output_dir, "Figure_1_holdout_metrics.csv"),
   row.names = FALSE
 )
 
 write.csv(
-  panel_b_data,
-  file.path(
-    output_dir,
-    "Figure_2b_control_stratified_rates.csv"
-  ),
+  annual_emissions,
+  file.path(output_dir, "Figure_1_annual_emissions.csv"),
   row.names = FALSE
 )
 
-# ================================================================
-# 8. Publication theme
-# ================================================================
+# ==============================================================================
+# 5. Plot helpers
+# ==============================================================================
+
+observed_color <- "black"
+predicted_color <- "#3B6FB6"
 
 theme_publication <- function(base_size = 10) {
-  theme_classic(
-    base_size = base_size,
-    base_family = "sans"
-  ) +
+  theme_classic(base_size = base_size, base_family = "sans") +
     theme(
-      text = element_text(
-        color = "black"
-      ),
-      
-      axis.title = element_text(
-        size = base_size,
-        color = "black"
-      ),
-      
-      axis.text = element_text(
-        size = base_size - 1,
-        color = "black"
-      ),
-      
-      axis.ticks = element_line(
-        color = "black",
-        linewidth = 0.35
-      ),
-      
-      axis.ticks.length = grid::unit(
-        0.15,
-        "cm"
-      ),
-      
+      text = element_text(color = "black"),
+      axis.title = element_text(size = base_size, color = "black"),
+      axis.text = element_text(size = base_size - 1, color = "black"),
+      axis.ticks = element_line(color = "black", linewidth = 0.35),
+      axis.ticks.length = grid::unit(0.15, "cm"),
       panel.border = element_rect(
         color = "black",
         fill = NA,
         linewidth = 0.45
       ),
-      
-      panel.grid.major.y = element_line(
-        color = "grey88",
-        linewidth = 0.3
-      ),
-      
-      panel.grid.major.x = element_blank(),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
       panel.grid.minor = element_blank(),
-      
-      strip.background = element_rect(
-        fill = "grey95",
-        color = "black",
-        linewidth = 0.4
-      ),
-      
-      strip.text = element_text(
-        size = base_size,
-        face = "bold",
-        color = "black",
-        margin = margin(
-          t = 4,
-          r = 4,
-          b = 4,
-          l = 4
-        )
-      ),
-      
       legend.title = element_blank(),
-      legend.text = element_text(
-        size = base_size - 1
-      ),
-      
-      legend.key.width = grid::unit(
-        1.5,
-        "cm"
-      ),
-      
-      panel.spacing = grid::unit(
-        0.8,
-        "lines"
-      ),
-      
-      plot.margin = margin(
-        t = 5,
-        r = 6,
-        b = 5,
-        l = 5
+      legend.text = element_text(size = base_size - 1),
+      legend.key.width = grid::unit(1.3, "cm"),
+      plot.margin = margin(5, 6, 5, 5)
+    )
+}
+
+pollutant_expression <- function(pollutant) {
+  if (pollutant == "SO2") expression(SO[2]) else expression(NO[x])
+}
+
+make_holdout_panel <- function(pollutant_name) {
+  plot_data <- holdout %>%
+    filter(pollutant == pollutant_name)
+
+  label_data <- metric_labels %>%
+    filter(pollutant == pollutant_name)
+
+  upper_limit <- max(
+    c(
+      plot_data$observed_EF_g_per_kWh,
+      plot_data$predicted_EF_g_per_kWh
+    ),
+    na.rm = TRUE
+  )
+
+  ggplot(
+    plot_data,
+    aes(
+      x = observed_EF_g_per_kWh,
+      y = predicted_EF_g_per_kWh
+    )
+  ) +
+    geom_abline(
+      intercept = 0,
+      slope = 1,
+      color = "grey35",
+      linewidth = 0.65,
+      linetype = "dashed"
+    ) +
+    geom_point(
+      color = predicted_color,
+      alpha = 0.18,
+      size = 0.85
+    ) +
+    annotate(
+      "label",
+      x = 0.04 * upper_limit,
+      y = 0.96 * upper_limit,
+      label = label_data$label,
+      hjust = 0,
+      vjust = 1,
+      size = 3.0,
+      label.size = 0.25,
+      fill = alpha("white", 0.88)
+    ) +
+    coord_equal(
+      xlim = c(0, upper_limit),
+      ylim = c(0, upper_limit),
+      expand = FALSE
+    ) +
+    scale_x_continuous(labels = label_number(accuracy = 0.1)) +
+    scale_y_continuous(labels = label_number(accuracy = 0.1)) +
+    labs(
+      title = pollutant_expression(pollutant_name),
+      x = expression("Observed emission factor (g kWh"^{-1} * ")"),
+      y = expression("Predicted emission factor (g kWh"^{-1} * ")")
+    ) +
+    theme_publication(base_size = 10) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 10
       )
     )
 }
 
-# ================================================================
-# 9. Draw panel (a)
-# ================================================================
+make_annual_panel <- function(pollutant_name) {
+  plot_data <- annual_long %>%
+    filter(pollutant == pollutant_name)
 
-panel_a <- ggplot(
-  panel_a_data,
-  aes(
-    x = Year,
-    y = emission_rate,
-    group = pollutant
-  )
-) +
-  geom_line(
-    color = "black",
-    linewidth = 0.9
-  ) +
-  geom_point(
-    color = "black",
-    shape = 16,
-    size = 1.8
-  ) +
-  facet_wrap(
-    ~pollutant,
-    nrow = 1,
-    scales = "free_y",
-    labeller = label_parsed
-  ) +
-  scale_x_continuous(
-    breaks = seq(1995, 2020, by = 5),
-    limits = c(1995.5, 2020.5),
-    expand = expansion(mult = c(0, 0))
-  ) +
-  scale_y_continuous(
-    labels = label_number(
-      accuracy = 0.1,
-      trim = TRUE
-    ),
-    limits = c(0, NA),
-    expand = expansion(
-      mult = c(0, 0.08)
+  ggplot(
+    plot_data,
+    aes(
+      x = Year,
+      y = emissions_million_short_tons,
+      color = series,
+      linetype = series,
+      shape = series,
+      group = series
     )
   ) +
-  labs(
-    x = "Year",
-    y = expression(
-      "Emission rate (lb MMBtu"^{-1} * ")"
-    )
-  ) +
-  theme_publication(base_size = 10)
-
-# ================================================================
-# 10. Draw panel (b)
-# ================================================================
-
-control_linetypes <- c(
-  "No reported pollutant-specific control" = "solid",
-  "Reported pollutant-specific control" = "dashed"
-)
-
-control_shapes <- c(
-  "No reported pollutant-specific control" = 16,
-  "Reported pollutant-specific control" = 17
-)
-
-panel_b <- ggplot(
-  panel_b_data,
-  aes(
-    x = Year,
-    y = emission_rate,
-    linetype = control_status,
-    shape = control_status,
-    group = control_status
-  )
-) +
-  geom_line(
-    color = "black",
-    linewidth = 0.9
-  ) +
-  geom_point(
-    color = "black",
-    size = 1.8
-  ) +
-  facet_wrap(
-    ~pollutant,
-    nrow = 1,
-    scales = "free_y",
-    labeller = label_parsed
-  ) +
-  scale_linetype_manual(
-    values = control_linetypes,
-    breaks = control_levels,
-    name = NULL
-  ) +
-  scale_shape_manual(
-    values = control_shapes,
-    breaks = control_levels,
-    name = NULL
-  ) +
-  scale_x_continuous(
-    breaks = seq(1995, 2020, by = 5),
-    limits = c(1995.5, 2020.5),
-    expand = expansion(mult = c(0, 0))
-  ) +
-  scale_y_continuous(
-    labels = label_number(
-      accuracy = 0.1,
-      trim = TRUE
-    ),
-    limits = c(0, NA),
-    expand = expansion(
-      mult = c(0, 0.08)
-    )
-  ) +
-  labs(
-    x = "Year",
-    y = expression(
-      "Emission rate (lb MMBtu"^{-1} * ")"
-    )
-  ) +
-  guides(
-    linetype = guide_legend(
-      nrow = 1,
-      byrow = TRUE
-    ),
-    shape = guide_legend(
-      nrow = 1,
-      byrow = TRUE
-    )
-  ) +
-  theme_publication(base_size = 10) +
-  theme(
-    legend.position = "bottom",
-    legend.direction = "horizontal"
-  )
-
-# ================================================================
-# 11. Combine panels vertically
-# ================================================================
-
-figure2_combined <- patchwork::wrap_plots(
-  panel_a,
-  panel_b,
-  ncol = 1,
-  heights = c(1, 1.08)
-) +
-  patchwork::plot_annotation(
-    tag_levels = "a",
-    tag_prefix = "(",
-    tag_suffix = ")",
-    theme = theme(
-      plot.tag = element_text(
-        family = "sans",
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.7) +
+    scale_color_manual(
+      values = c(
+        "CAMPD" = observed_color,
+        "XGBoost" = predicted_color
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "CAMPD" = "solid",
+        "XGBoost" = "dashed"
+      )
+    ) +
+    scale_shape_manual(
+      values = c(
+        "CAMPD" = 16,
+        "XGBoost" = 17
+      )
+    ) +
+    scale_x_continuous(
+      breaks = seq(2000, 2020, by = 5),
+      limits = c(1996.5, 2020.5),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    scale_y_continuous(
+      labels = label_number(accuracy = 0.1, trim = TRUE),
+      limits = c(0, NA),
+      expand = expansion(mult = c(0, 0.07))
+    ) +
+    labs(
+      title = pollutant_expression(pollutant_name),
+      x = "Year",
+      y = expression("Annual emissions (million short tons yr"^{-1} * ")")
+    ) +
+    theme_publication(base_size = 10) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
         face = "bold",
-        size = 11,
-        color = "black"
+        size = 10
       ),
-      
-      plot.tag.position = c(
-        0.002,
-        0.998
-      ),
-      
-      plot.margin = margin(
-        5,
-        5,
-        5,
-        5
+      legend.position = "bottom",
+      legend.direction = "horizontal"
+    )
+}
+
+# ==============================================================================
+# 6. Draw and combine panels
+# ==============================================================================
+
+panel_a <- make_holdout_panel("SO2")
+panel_b <- make_holdout_panel("NOx")
+panel_c <- make_annual_panel("SO2")
+panel_d <- make_annual_panel("NOx")
+
+extract_legend <- function(plot_object) {
+  plot_grob <- ggplotGrob(plot_object)
+  guide_positions <- grep("^guide-box", plot_grob$layout$name)
+
+  for (position in guide_positions) {
+    candidate <- plot_grob$grobs[[position]]
+    if (!inherits(candidate, "zeroGrob")) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not extract the annual-series legend.")
+}
+
+common_legend <- extract_legend(panel_d)
+
+# The two annual panels share one legend below the complete figure.
+panel_c <- panel_c +
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1
+  )
+panel_d <- panel_d +
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1
+  )
+
+# Convert to grobs and impose identical left/right dimensions. This keeps the
+# panel boundaries, axis titles, and panel tags aligned despite different label
+# widths in the scatter and annual-emissions rows.
+panel_grobs <- list(
+  ggplotGrob(panel_a),
+  ggplotGrob(panel_b),
+  ggplotGrob(panel_c),
+  ggplotGrob(panel_d)
+)
+
+common_widths <- do.call(
+  grid::unit.pmax,
+  lapply(panel_grobs, function(x) x$widths)
+)
+
+top_heights <- grid::unit.pmax(
+  panel_grobs[[1]]$heights,
+  panel_grobs[[2]]$heights
+)
+
+bottom_heights <- grid::unit.pmax(
+  panel_grobs[[3]]$heights,
+  panel_grobs[[4]]$heights
+)
+
+for (i in seq_along(panel_grobs)) {
+  panel_grobs[[i]]$widths <- common_widths
+}
+
+panel_grobs[[1]]$heights <- top_heights
+panel_grobs[[2]]$heights <- top_heights
+panel_grobs[[3]]$heights <- bottom_heights
+panel_grobs[[4]]$heights <- bottom_heights
+
+# Use only the base-R grid package to arrange panels. No patchwork, cowplot,
+# or gridExtra installation is required on Hopper.
+draw_figure1 <- function() {
+  grid::grid.newpage()
+  layout <- grid::grid.layout(
+    nrow = 3,
+    ncol = 2,
+    widths = grid::unit(c(1, 1), "null"),
+    heights = grid::unit(c(1, 1, 0.11), "null")
+  )
+  grid::pushViewport(grid::viewport(layout = layout))
+
+  draw_panel <- function(grob, row, column, tag) {
+    grid::pushViewport(
+      grid::viewport(layout.pos.row = row, layout.pos.col = column)
+    )
+    grid::grid.draw(grob)
+    grid::grid.text(
+      label = tag,
+      x = grid::unit(0.015, "npc"),
+      y = grid::unit(0.995, "npc"),
+      just = c("left", "top"),
+      gp = grid::gpar(
+        fontfamily = "sans",
+        fontface = "plain",
+        fontsize = 10,
+        col = "black"
       )
     )
+    grid::popViewport()
+  }
+
+  draw_panel(panel_grobs[[1]], 1, 1, "(a)")
+  draw_panel(panel_grobs[[2]], 1, 2, "(b)")
+  draw_panel(panel_grobs[[3]], 2, 1, "(c)")
+  draw_panel(panel_grobs[[4]], 2, 2, "(d)")
+
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 3, layout.pos.col = 1:2)
   )
+  grid::grid.draw(common_legend)
+  grid::popViewport()
 
-print(figure2_combined)
+  grid::popViewport()
+}
 
-# ================================================================
-# 12. Save final Figure 2
-# ================================================================
+draw_figure1()
 
-ggsave(
-  filename = file.path(
-    output_dir,
-    "Figure_2_coal_emission_rates.tiff"
-  ),
-  plot = figure2_combined,
-  width = 7.4,
-  height = 6.8,
+# ==============================================================================
+# 7. Save Figure 1
+# ==============================================================================
+
+grDevices::pdf(
+  file = file.path(output_dir, "Figure_1_model_evaluation.pdf"),
+  width = 7.5,
+  height = 7.1,
+  onefile = TRUE,
+  useDingbats = FALSE
+)
+draw_figure1()
+grDevices::dev.off()
+
+grDevices::tiff(
+  filename = file.path(output_dir, "Figure_1_model_evaluation.tiff"),
+  width = 7.5,
+  height = 7.1,
   units = "in",
-  dpi = 600,
+  res = 600,
   compression = "lzw",
   bg = "white"
 )
-
-ggsave(
-  filename = file.path(
-    output_dir,
-    "Figure_2_coal_emission_rates.pdf"
-  ),
-  plot = figure2_combined,
-  width = 7.4,
-  height = 6.8,
-  units = "in",
-  device = "pdf",
-  bg = "white"
-)
+draw_figure1()
+grDevices::dev.off()
 
 message(
-  "Figure 2 saved to: ",
-  normalizePath(output_dir)
+  "Figure 1 saved to: ",
+  normalizePath(output_dir, mustWork = FALSE)
 )
 
+message("Independent-holdout metrics:")
+print(holdout_metrics)
