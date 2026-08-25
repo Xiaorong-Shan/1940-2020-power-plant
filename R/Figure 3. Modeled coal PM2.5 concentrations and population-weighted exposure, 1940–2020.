@@ -112,6 +112,32 @@ for (this_dir in c(
   )
 }
 
+COUNTY_TABLE_FILE <- file.path(
+  TABLE_DIR,
+  "county_pm25_pop_all_years_1940_2020.csv"
+)
+
+PWE_TABLE_FILE <- file.path(
+  TABLE_DIR,
+  "national_PWE_1940_2020.csv"
+)
+
+QA_TABLE_FILE <- file.path(
+  QA_DIR,
+  "Figure_3_year_QA_1940_2020.csv"
+)
+
+# The layout revision does not require recalculating county concentrations.
+# Reuse the validated tables from the completed Figure 3 run when available.
+REUSE_COMPLETED_TABLES <- all(
+  file.exists(
+    c(
+      COUNTY_TABLE_FILE,
+      PWE_TABLE_FILE
+    )
+  )
+)
+
 P4S <- paste(
   "+proj=aea +lat_1=20 +lat_2=60",
   "+lat_0=40 +lon_0=-96",
@@ -122,7 +148,9 @@ P4S <- paste(
 MAP_CAP_QUANTILE <- 0.99
 
 FIGURE_WIDTH <- 7.4
-FIGURE_HEIGHT <- 11.8
+# Preserve enough vertical space for the two map blocks and the bottom plots,
+# while remaining substantially shorter than the original 11.8-inch canvas.
+FIGURE_HEIGHT <- 8.9
 
 HISTORICAL_MAP_COLORS <- c(
   "#fff7ec",
@@ -811,11 +839,11 @@ make_map_panel <- function(
         title.position = "top",
         title.hjust = 0.5,
         barwidth = unit(
-          4.8,
+          4.6,
           "cm"
         ),
         barheight = unit(
-          0.30,
+          0.27,
           "cm"
         ),
         ticks = FALSE
@@ -835,14 +863,14 @@ make_map_panel <- function(
       plot.title.position = "plot",
       plot.title = element_text(
         family = "sans",
-        face = "bold",
-        size = 10.5,
+        face = "plain",
+        size = 10,
         color = "black",
         hjust = 0,
         margin = margin(
-          t = 1,
+          t = 0,
           r = 0,
-          b = 3,
+          b = 1,
           l = 0
         )
       ),
@@ -867,7 +895,7 @@ make_map_panel <- function(
         "lines"
       ),
       panel.spacing.y = unit(
-        0.45,
+        0.30,
         "lines"
       ),
       legend.position = "bottom",
@@ -889,14 +917,14 @@ make_map_panel <- function(
         l = 0
       ),
       legend.box.spacing = unit(
-        0.08,
+        0.05,
         "cm"
       ),
       plot.margin = margin(
-        t = 2,
-        r = 8,
-        b = 0,
-        l = 8
+        t = 1,
+        r = 6,
+        b = 1,
+        l = 6
       )
     )
 }
@@ -912,62 +940,68 @@ cat(
   sep = ""
 )
 
-input_files <- vapply(
-  YEARS,
-  resolve_pm25_file,
-  character(1)
-)
+if (REUSE_COMPLETED_TABLES) {
+  cat(
+    "Validated county and PWE tables found; skipping PM2.5 recalculation.\n\n"
+  )
+} else {
+  input_files <- vapply(
+    YEARS,
+    resolve_pm25_file,
+    character(1)
+  )
 
-missing_inputs <- input_files[
-  !file.exists(input_files)
-]
+  missing_inputs <- input_files[
+    !file.exists(input_files)
+  ]
 
-if (length(missing_inputs) > 0L) {
-  stop(
-    "Required PM2.5 files are missing:\n",
-    paste(
-      paste0("  ", missing_inputs),
-      collapse = "\n"
+  if (length(missing_inputs) > 0L) {
+    stop(
+      "Required PM2.5 files are missing:\n",
+      paste(
+        paste0("  ", missing_inputs),
+        collapse = "\n"
+      )
+    )
+  }
+
+  if (!file.exists(POP_FILE)) {
+    stop(
+      "Population file not found: ",
+      POP_FILE
+    )
+  }
+
+  population_header <- names(
+    data.table::fread(
+      POP_FILE,
+      nrows = 0L
     )
   )
-}
 
-if (!file.exists(POP_FILE)) {
-  stop(
-    "Population file not found: ",
-    POP_FILE
+  required_population_columns <- c(
+    "STATEFP",
+    "COUNTYFP",
+    paste0("A00AA", YEARS)
   )
-}
 
-population_header <- names(
-  data.table::fread(
-    POP_FILE,
-    nrows = 0L
+  missing_population_columns <- setdiff(
+    required_population_columns,
+    population_header
   )
-)
 
-required_population_columns <- c(
-  "STATEFP",
-  "COUNTYFP",
-  paste0("A00AA", YEARS)
-)
-
-missing_population_columns <- setdiff(
-  required_population_columns,
-  population_header
-)
-
-if (length(missing_population_columns) > 0L) {
-  stop(
-    "Population file is missing required columns: ",
-    paste(
-      missing_population_columns,
-      collapse = ", "
+  if (length(missing_population_columns) > 0L) {
+    stop(
+      "Population file is missing required columns: ",
+      paste(
+        missing_population_columns,
+        collapse = ", "
+      )
     )
-  )
-}
+  }
 
-cat("All nine PM2.5 files and population columns passed preflight.\n\n")
+  cat("All nine PM2.5 files and population columns passed preflight.\n\n")
+}
 
 # ==============================================================================
 # 3. County and state geometry
@@ -1078,6 +1112,47 @@ cat(
 # ==============================================================================
 # 4. Population data: one NHGIS file for all nine years
 # ==============================================================================
+
+if (REUSE_COMPLETED_TABLES) {
+  county_all <- data.table::fread(
+    COUNTY_TABLE_FILE
+  )
+
+  # fread may parse five-digit county FIPS codes as integers and remove
+  # leading zeros. Restore the same five-character type used by the county
+  # geometry before joining the cached results to the map.
+  county_all[
+    ,
+    geoid := fmt_geoid5(geoid)
+  ]
+
+  county_all[
+    ,
+    year := as.integer(year)
+  ]
+
+  national_pwe <- data.table::fread(
+    PWE_TABLE_FILE
+  )
+
+  national_pwe[
+    ,
+    year := as.integer(year)
+  ]
+
+  year_qa <- if (file.exists(QA_TABLE_FILE)) {
+    data.table::fread(QA_TABLE_FILE)
+  } else {
+    data.table::data.table()
+  }
+
+  cat(
+    "Loaded existing plotting tables from: ",
+    TABLE_DIR,
+    "\n",
+    sep = ""
+  )
+} else {
 
 population_wide <- data.table::fread(
   POP_FILE
@@ -1608,11 +1683,10 @@ data.table::fwrite(
 
 data.table::fwrite(
   year_qa,
-  file.path(
-    QA_DIR,
-    "Figure_3_year_QA_1940_2020.csv"
-  )
+  QA_TABLE_FILE
 )
+
+}
 
 # ==============================================================================
 # 6. Plot data
@@ -1627,6 +1701,40 @@ map_panel <- data.table::CJ(
   year = YEARS,
   unique = TRUE
 )
+
+# Enforce identical join-key types even if a cached CSV or data.table helper
+# has converted numeric-looking FIPS codes to integers.
+counties_sf$geoid <- fmt_geoid5(
+  counties_sf$geoid
+)
+
+map_panel[
+  ,
+  geoid := fmt_geoid5(geoid)
+]
+
+county_all[
+  ,
+  geoid := fmt_geoid5(geoid)
+]
+
+cat(
+  "Join-key classes before map merge: map_panel.geoid = ",
+  class(map_panel$geoid)[1L],
+  "; county_all.geoid = ",
+  class(county_all$geoid)[1L],
+  "\n",
+  sep = ""
+)
+
+if (
+  !is.character(map_panel$geoid) ||
+    !is.character(county_all$geoid)
+) {
+  stop(
+    "County GEOID conversion failed before the map merge."
+  )
+}
 
 map_panel <- merge(
   map_panel,
@@ -1733,40 +1841,185 @@ pwe_plot_data <- copy(
 )
 
 # ==============================================================================
-# 7. Panels (a) and (b): split-period county maps
+# 7. Panel (a): all county maps on one shared scale
 # ==============================================================================
 
-panel_a <- make_map_panel(
-  map_data = map_sf,
-  state_data = states_sf,
-  years = HISTORICAL_YEARS,
-  scale_info = historical_scale,
-  panel_title = "(a)",
-  legend_title = expression(
-    "Historical coal PM"[2.5] *
-      " (" *
-      mu * "g " * m^{-3} *
-      ")"
-  ),
-  facet_rows = 2,
-  map_colors = HISTORICAL_MAP_COLORS
+# A square-root transformation preserves a common quantitative scale while
+# retaining visible variation below 0.5 ug/m3. All legend labels remain in the
+# original concentration units.
+common_map_cap <- max(
+  historical_scale$cap,
+  modern_scale$cap
 )
 
-panel_b <- make_map_panel(
-  map_data = map_sf,
-  state_data = states_sf,
-  years = MODERN_YEARS,
-  scale_info = modern_scale,
-  panel_title = "(b)",
-  legend_title = expression(
-    "Modern coal PM"[2.5] *
-      " (" *
-      mu * "g " * m^{-3} *
-      ")"
-  ),
-  facet_rows = 1,
-  map_colors = MODERN_MAP_COLORS
+common_map_breaks <- c(
+  0,
+  0.1,
+  0.5,
+  1.5,
+  3,
+  common_map_cap
 )
+
+common_map_breaks <- unique(
+  common_map_breaks[
+    common_map_breaks >= 0 &
+      common_map_breaks <= common_map_cap
+  ]
+)
+
+common_map_label_text <- format(
+  common_map_breaks,
+  trim = TRUE,
+  scientific = FALSE
+)
+
+common_map_label_expressions <- paste0(
+  "'",
+  common_map_label_text,
+  "'"
+)
+
+# Use plotmath for the upper-limit label so Hopper renders a true
+# greater-than-or-equal-to symbol instead of the ASCII characters ">=".
+common_map_label_expressions[
+  length(common_map_label_expressions)
+] <- paste0(
+  "phantom(0) >= ",
+  format(
+    common_map_cap,
+    trim = TRUE,
+    scientific = FALSE
+  )
+)
+
+common_map_labels <- parse(
+  text = common_map_label_expressions
+)
+
+panel_maps <- ggplot() +
+  geom_sf(
+    data = map_sf,
+    aes(
+      fill = pm25
+    ),
+    color = NA,
+    linewidth = 0
+  ) +
+  geom_sf(
+    data = states_sf,
+    inherit.aes = FALSE,
+    fill = NA,
+    color = "grey55",
+    linewidth = 0.14
+  ) +
+  facet_wrap(
+    ~year,
+    ncol = 3,
+    nrow = 3,
+    drop = TRUE
+  ) +
+  scale_fill_gradientn(
+    colors = MODERN_MAP_COLORS,
+    limits = c(
+      0,
+      common_map_cap
+    ),
+    breaks = common_map_breaks,
+    labels = common_map_labels,
+    trans = scales::sqrt_trans(),
+    oob = scales::squish,
+    na.value = MODERN_MAP_COLORS[1],
+    name = expression(
+      "Coal PM"[2.5] *
+        " (" *
+        mu * "g " * m^{-3} *
+        ")"
+    ),
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      barheight = grid::unit(
+        3.0,
+        "mm"
+      ),
+      barwidth = grid::unit(
+        55,
+        "mm"
+      ),
+      ticks = FALSE
+    )
+  ) +
+  coord_sf(
+    datum = NA
+  ) +
+  labs(
+    title = "(a)"
+  ) +
+  theme_void(
+    base_size = 10,
+    base_family = "sans"
+  ) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(
+      face = "plain",
+      size = 10,
+      hjust = 0,
+      margin = margin(
+        0,
+        0,
+        1,
+        0
+      )
+    ),
+    strip.background = element_rect(
+      fill = "grey95",
+      color = "black",
+      linewidth = 0.35
+    ),
+    strip.text = element_text(
+      size = 8.7,
+      face = "plain",
+      color = "black",
+      margin = margin(
+        2,
+        2,
+        2,
+        2
+      )
+    ),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(
+      size = 8,
+      lineheight = 0.9
+    ),
+    legend.text = element_text(
+      size = 7
+    ),
+    panel.spacing = grid::unit(
+      0.15,
+      "lines"
+    ),
+    legend.margin = margin(
+      0,
+      0,
+      0,
+      0
+    ),
+    legend.box.spacing = grid::unit(
+      0.05,
+      "cm"
+    ),
+    plot.margin = margin(
+      2,
+      2,
+      2,
+      2
+    )
+  )
 
 # ==============================================================================
 # 8. Panel (c): county-level concentration distributions
@@ -1802,7 +2055,7 @@ panel_c <- ggplot(
     )
   ) +
   labs(
-    tag = "(c)",
+    title = "(b)",
     x = "Year",
     y = expression(
       "County-mean coal PM"[2.5] *
@@ -1815,15 +2068,19 @@ panel_c <- ggplot(
     base_size = 10
   ) +
   theme(
-    plot.tag = element_text(
+    plot.title.position = "plot",
+    plot.title = element_text(
       family = "sans",
-      face = "bold",
-      size = 11,
-      color = "black"
-    ),
-    plot.tag.position = c(
-      0.025,
-      0.975
+      face = "plain",
+      size = 10,
+      color = "black",
+      hjust = 0,
+      margin = margin(
+        0,
+        0,
+        14,
+        0
+      )
     ),
     axis.text.x = element_text(
       angle = 45,
@@ -1831,9 +2088,9 @@ panel_c <- ggplot(
       vjust = 1
     ),
     plot.margin = margin(
-      t = 10,
-      r = 6,
-      b = 5,
+      t = 8,
+      r = 5,
+      b = 4,
       l = 10
     )
   )
@@ -1889,11 +2146,10 @@ panel_d <- ggplot(
     )
   ) +
   labs(
-    tag = "(d)",
+    title = "(c)",
     x = "Year",
     y = expression(
-      "Population-weighted exposure" ~
-        "(" *
+      "PWE (" *
         mu * "g " * m^{-3} *
         ")"
     )
@@ -1902,15 +2158,19 @@ panel_d <- ggplot(
     base_size = 10
   ) +
   theme(
-    plot.tag = element_text(
+    plot.title.position = "plot",
+    plot.title = element_text(
       family = "sans",
-      face = "bold",
-      size = 11,
-      color = "black"
-    ),
-    plot.tag.position = c(
-      0.025,
-      0.975
+      face = "plain",
+      size = 10,
+      color = "black",
+      hjust = 0,
+      margin = margin(
+        0,
+        0,
+        7,
+        0
+      )
     ),
     axis.text.x = element_text(
       angle = 45,
@@ -1918,26 +2178,16 @@ panel_d <- ggplot(
       vjust = 1
     ),
     plot.margin = margin(
-      t = 10,
+      t = 8,
       r = 10,
-      b = 5,
+      b = 4,
       l = 6
     )
   )
 
 # ==============================================================================
-# 10. Combine and save Figure 3
+# 10. Combine and save Figure 3 using the Figure 5 layout method
 # ==============================================================================
-
-map_stack <- gridExtra::arrangeGrob(
-  panel_a,
-  panel_b,
-  ncol = 1,
-  heights = c(
-    1.55,
-    1
-  )
-)
 
 bottom_row <- gridExtra::arrangeGrob(
   panel_c,
@@ -1946,133 +2196,60 @@ bottom_row <- gridExtra::arrangeGrob(
   ncol = 3,
   widths = c(
     1,
-    0.09,
+    0.06,
     1
+  ),
+  padding = grid::unit(
+    0.02,
+    "cm"
   )
 )
 
+# Only one composition step is used: the single faceted map plot above the
+# two equally sized statistical plots. This follows the Figure 5 approach of
+# using compact plot margins and letting ggsave control the final canvas.
 figure3_combined <- gridExtra::arrangeGrob(
-  map_stack,
+  panel_maps,
   bottom_row,
   ncol = 1,
   heights = c(
-    2.35,
+    2.18,
     1
   ),
-  padding = unit(
-    0.12,
+  padding = grid::unit(
+    0.02,
     "cm"
   )
 )
 
 pdf_file <- file.path(
   FIG_DIR,
-  "Figure_3_coal_PM25_exposure_1940_2020_split_scales.pdf"
-)
-
-tiff_file <- file.path(
-  FIG_DIR,
-  "Figure_3_coal_PM25_exposure_1940_2020_split_scales.tiff"
+  "Figure_3_coal_PM25_exposure_1940_2020_fig5method_aligned_v12.pdf"
 )
 
 if (file.exists(pdf_file)) {
   file.remove(pdf_file)
 }
 
-if (file.exists(tiff_file)) {
-  file.remove(tiff_file)
-}
-
-grDevices::pdf(
-  file = pdf_file,
+ggplot2::ggsave(
+  filename = pdf_file,
+  plot = figure3_combined,
   width = FIGURE_WIDTH,
   height = FIGURE_HEIGHT,
-  onefile = TRUE,
-  useDingbats = FALSE,
-  paper = "special",
+  units = "in",
+  device = "pdf",
+  dpi = 300,
+  limitsize = FALSE,
   bg = "white"
 )
 
-grid::grid.newpage()
-grid::grid.draw(
-  figure3_combined
-)
-invisible(
-  grDevices::dev.off()
-)
-
-pdf_saved <- file.exists(
-  pdf_file
-)
-
+pdf_saved <- file.exists(pdf_file)
 tiff_saved <- FALSE
-
-if (capabilities("cairo")) {
-  grDevices::tiff(
-    filename = tiff_file,
-    width = FIGURE_WIDTH,
-    height = FIGURE_HEIGHT,
-    units = "in",
-    res = 600,
-    compression = "lzw",
-    type = "cairo",
-    bg = "white"
-  )
-
-  grid::grid.newpage()
-  grid::grid.draw(
-    figure3_combined
-  )
-  invisible(
-    grDevices::dev.off()
-  )
-
-  tiff_saved <- file.exists(
-    tiff_file
-  )
-}
-
-if (
-  !tiff_saved &&
-    requireNamespace(
-      "Cairo",
-      quietly = TRUE
-    )
-) {
-  Cairo::CairoTIFF(
-    filename = tiff_file,
-    width = FIGURE_WIDTH,
-    height = FIGURE_HEIGHT,
-    units = "in",
-    dpi = 600,
-    compression = "lzw",
-    bg = "white"
-  )
-
-  grid::grid.newpage()
-  grid::grid.draw(
-    figure3_combined
-  )
-  invisible(
-    grDevices::dev.off()
-  )
-
-  tiff_saved <- file.exists(
-    tiff_file
-  )
-}
 
 if (!pdf_saved) {
   stop(
     "The Figure 3 PDF was not created: ",
     pdf_file
-  )
-}
-
-if (!tiff_saved) {
-  warning(
-    "The PDF was created, but no compatible Cairo TIFF device was available.",
-    call. = FALSE
   )
 }
 
