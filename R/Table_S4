@@ -7,7 +7,8 @@
 #   2. facility-level 80:20 development/independent-holdout split;
 #   3. five-fold facility-grouped cross-validation on the development set;
 #   4. independent holdout evaluation on the original g/kWh scale;
-#   5. final refit using all modern facilities;
+#   5. final refit using all modern facilities and export of fitted predictions
+#      for every modern facility-year;
 #   6. historical 1940-1990 facility-year predictions with CF = 0.95,
 #      allocated back to generators for generator-level emissions outputs;
 #   7. generator- and facility-level historical emissions outputs;
@@ -22,20 +23,71 @@
 # 0. USER SETTINGS
 # ------------------------------------------------------------------------------
 
-# All paths below are fixed local Mac paths taken directly from the original
-# SO2/NOx scripts. This script does not search for input files and does not
-# switch to another directory when a path is missing.
-FACILITY_INFO_FILE <- "/Users/xshan2/OneDrive - George Mason University - O365 Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/EF_pp_paper_code/data/facility-attributes-1995-2020-CAMPD.csv"
+# Accept both current macOS OneDrive mounting conventions, while failing
+# explicitly rather than silently switching to a similarly named file.
+first_existing_path <- function(candidates, label) {
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) == 0L) {
+    stop(
+      "Cannot locate ", label, ". Checked:\n  ",
+      paste(candidates, collapse = "\n  ")
+    )
+  }
+  hit[1L]
+}
 
-FACILITY_EMISSION_FILE <- "/Users/xshan2/OneDrive - George Mason University - O365 Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/EF_pp_paper_code/data/annual-emissions-facility-aggregation-1995-2020-CAMPD.csv"
+legacy_data_relative <- paste0(
+  "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+  "EF_pp_paper_code/data"
+)
 
-HISTORICAL_GENERATOR_FILE <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/december_generator2022.xlsx"
+one_drive_roots <- c(
+  paste0(
+    "/Users/xshan2/Library/CloudStorage/",
+    "OneDrive-GeorgeMasonUniversity-O365Production"
+  ),
+  "/Users/xshan2/OneDrive - George Mason University - O365 Production"
+)
+
+FACILITY_INFO_FILE <- first_existing_path(
+  file.path(
+    one_drive_roots,
+    legacy_data_relative,
+    "facility-attributes-1995-2020-CAMPD.csv"
+  ),
+  "facility attribute file"
+)
+
+FACILITY_EMISSION_FILE <- first_existing_path(
+  file.path(
+    one_drive_roots,
+    legacy_data_relative,
+    "annual-emissions-facility-aggregation-1995-2020-CAMPD.csv"
+  ),
+  "facility emissions file"
+)
+
+HISTORICAL_GENERATOR_FILE <- first_existing_path(
+  file.path(
+    one_drive_roots,
+    paste0(
+      "GMU_PhD/01_Research/02_2019fall_ADRD/prelim_analysis/PowerPlant/",
+      "december_generator2022.xlsx"
+    )
+  ),
+  "December 2022 generator workbook"
+)
 
 # The December 2022 workbook already supplies plant coordinates. No separate
 # generator2010_gen.csv input is required for this rebuild.
 HISTORICAL_LOCATION_FILE <- NA_character_
 
-OUT_DIR <- "/Users/xshan2/Library/CloudStorage/OneDrive-GeorgeMasonUniversity-O365Production/GMU_PhD/01_Research/03_powerplant/data/TableS4_facility_level_rebuild"
+OUT_DIR <- paste0(
+  "/Users/xshan2/Library/CloudStorage/",
+  "OneDrive-GeorgeMasonUniversity-O365Production/",
+  "GMU_PhD/01_Research/03_powerplant/data/",
+  "TableS4_fullsample_export_20260916"
+)
 
 SEED <- 123L
 DEVELOPMENT_FRACTION <- 0.80
@@ -1066,13 +1118,36 @@ run_pollutant_model <- function(prepared, seed_offset = 0L) {
     residual_g_per_kWh = predicted_ef - observed_ef
   )
 
-  # Refit on all modern facilities for historical prediction only.
+  # Refit on all modern facilities for historical prediction and for the
+  # full-sample modern comparison requested in Figure S3.
   dall <- xgb.DMatrix(X_all, label = y_all)
   full_model <- xgb.train(
     params = selected_params,
     data = dall,
     nrounds = selected_rounds,
     verbose = 0
+  )
+
+  # These are fitted values from the model refit on the complete modern data,
+  # not independent holdout predictions. They are exported so observed and
+  # predicted annual mean EFs can be compared across every eGRID subregion.
+  fullsample_prediction_log <- predict(full_model, dall)
+  fullsample_observed_ef <- pmax(0, 10^y_all - 1)
+  fullsample_predicted_ef <- pmax(
+    0,
+    10^fullsample_prediction_log - 1
+  )
+
+  fullsample_predictions <- data.table(
+    pollutant = pollutant,
+    facility_id = dt$facility_id,
+    Year = dt$Year,
+    convert_fuel = as.character(dt$convert_fuel),
+    Unit.Type = as.character(dt$Unit.Type),
+    partition = dt$partition,
+    observed_EF_g_per_kWh = fullsample_observed_ef,
+    predicted_EF_g_per_kWh = fullsample_predicted_ef,
+    residual_g_per_kWh = fullsample_predicted_ef - fullsample_observed_ef
   )
 
   development_facilities <- uniqueN(dt$facility_id[development_rows])
@@ -1132,6 +1207,7 @@ run_pollutant_model <- function(prepared, seed_offset = 0L) {
     cv_summary = cv_summary,
     model_summary = model_summary,
     holdout_predictions = holdout_predictions,
+    fullsample_predictions = fullsample_predictions,
     evaluation_model = evaluation_model,
     full_model = full_model,
     fuel_levels = prepared$fuel_levels,
@@ -1173,6 +1249,18 @@ holdout_all <- rbindlist(
   fill = TRUE
 )
 fwrite(holdout_all, file.path(OUT_DIR, "TableS4_holdout_predictions.csv"))
+
+fullsample_all <- rbindlist(
+  list(
+    so2_model_result$fullsample_predictions,
+    nox_model_result$fullsample_predictions
+  ),
+  fill = TRUE
+)
+fwrite(
+  fullsample_all,
+  file.path(OUT_DIR, "TableS4_fullsample_predictions.csv")
+)
 
 xgb.save(
   so2_model_result$evaluation_model,
@@ -2283,6 +2371,7 @@ main_output_names <- c(
   "TableS4_ready_to_copy.csv",
   "TableS4_results_sentence.txt",
   "TableS4_holdout_predictions.csv",
+  "TableS4_fullsample_predictions.csv",
   "TableS4_grouped_CV_summary.csv",
   "historical_generator_emissions_1940_1990_CF095.csv",
   "historical_facility_emissions_1940_1990_CF095.csv",
@@ -2325,3 +2414,4 @@ writeLines(
 
 message("\n", paste(completion_text, collapse = "\n"))
 message("\nReady-to-use Results sentence:\n", results_sentence)
+
