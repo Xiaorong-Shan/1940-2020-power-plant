@@ -1,9 +1,8 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# VERSION 2 (eGRID ORISPL-to-subregion crosswalk)
-# Figure S2. Coal-fired SO2 emission rates in major eGRID subregions
-# CAMPD, 1996-2020
+# Figure S3. Full-sample observed and fitted coal-fired SO2 emission factors
+# in major eGRID subregions, 1996-2020
 # ================================================================
 
 rm(list = ls(all.names = TRUE))
@@ -84,7 +83,12 @@ attribute_file <- choose_file(
   "facility-attributes-1995-2020-CAMPD.csv"
 )
 
-# Locate both versions. The historical Figure S2 was based on the
+prediction_file <- choose_file(
+  find_files("TableS4_fullsample_predictions\\.csv$"),
+  "TableS4_fullsample_predictions.csv"
+)
+
+# Locate both versions. The original regional-rate figure was based on the
 # facility-aggregation series; use it by default because Unit.ID formatting
 # differs between some CAMPD downloads and can cause most unit joins to fail.
 unit_emission_candidates <- find_files(
@@ -105,6 +109,7 @@ emission_file <- if (length(facility_emission_candidates) > 0) {
 
 message("Attributes: ", attribute_file)
 message("Emissions:  ", emission_file)
+message("Predictions: ", prediction_file)
 message("Analysis level: ", ifelse(use_unit_data, "unit", "facility fallback"))
 
 # ----------------------------------------------------------------
@@ -434,7 +439,10 @@ if (length(selected_regions) == 0) {
 
 write_csv(
   region_selection,
-  file.path(processed_dir, "Figure_S2_subregion_selection.csv")
+  file.path(
+    processed_dir,
+    "Figure_S3_subregion_selection_fullsample_EF_20260916.csv"
+  )
 )
 
 message(
@@ -443,56 +451,170 @@ message(
 )
 
 # ----------------------------------------------------------------
-# 7. Regional heat-input-weighted SO2 emission rates
+# 7. Full-sample observed and fitted SO2 emission factors
 # ----------------------------------------------------------------
 
-regional_rates <- analysis_data %>%
-  filter(
-    region %in% selected_regions,
-    is.finite(so2_short_tons),
-    is.finite(heat_input_mmbtu),
-    heat_input_mmbtu > 0,
-    so2_short_tons >= 0
+predictions_raw <- read_csv(
+  prediction_file,
+  show_col_types = FALSE,
+  guess_max = 300000
+) %>%
+  clean_names()
+
+prediction_names <- names(predictions_raw)
+observed_ef_col <- first_match(
+  prediction_names,
+  c("^observed.*ef.*g.*per.*k.*wh$")
+)
+predicted_ef_col <- first_match(
+  prediction_names,
+  c("^predicted.*ef.*g.*per.*k.*wh$")
+)
+
+required_prediction_columns <- c(
+  "pollutant", "facility_id", "year", "convert_fuel"
+)
+missing_predictions <- setdiff(
+  required_prediction_columns,
+  prediction_names
+)
+
+if (
+  length(missing_predictions) > 0 ||
+  is.na(observed_ef_col) ||
+  is.na(predicted_ef_col)
+) {
+  stop(
+    "Required full-sample prediction columns were not found. Available columns: ",
+    paste(prediction_names, collapse = ", ")
+  )
+}
+
+# Collapse any duplicate facility-year rows before calculating regional means,
+# so each facility contributes once to a region-year average.
+fullsample_predictions <- predictions_raw %>%
+  transmute(
+    facility_id = normalize_id(facility_id),
+    year = as.integer(year),
+    pollutant = toupper(trimws(as.character(pollutant))),
+    fuel = as.character(convert_fuel),
+    observed_ef_g_per_kwh = num(.data[[observed_ef_col]]),
+    predicted_ef_g_per_kwh = num(.data[[predicted_ef_col]])
   ) %>%
+  filter(
+    pollutant == "SO2",
+    is_coal_fuel(fuel),
+    year >= 1996,
+    year <= 2020,
+    is.finite(observed_ef_g_per_kwh),
+    is.finite(predicted_ef_g_per_kwh),
+    observed_ef_g_per_kwh >= 0,
+    predicted_ef_g_per_kwh >= 0
+  ) %>%
+  group_by(facility_id, year) %>%
+  summarise(
+    observed_ef_g_per_kwh = mean(observed_ef_g_per_kwh),
+    predicted_ef_g_per_kwh = mean(predicted_ef_g_per_kwh),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    plant_subregion_crosswalk %>% select(facility_id, region),
+    by = "facility_id"
+  ) %>%
+  filter(region %in% selected_regions)
+
+covered_regions <- sort(unique(fullsample_predictions$region))
+missing_regions <- setdiff(selected_regions, covered_regions)
+if (length(missing_regions) > 0) {
+  stop(
+    "Full-sample predictions are missing selected eGRID subregions: ",
+    paste(missing_regions, collapse = ", "),
+    ". The figure was not created because empty panels would result."
+  )
+}
+
+regional_efs <- fullsample_predictions %>%
   group_by(region, year) %>%
   summarise(
-    so2_short_tons = sum(so2_short_tons, na.rm = TRUE),
-    heat_input_mmbtu = sum(heat_input_mmbtu, na.rm = TRUE),
-    n_records = n(),
-    so2_rate_lb_mmbtu = so2_short_tons * 2000 / heat_input_mmbtu,
+    observed_mean_ef_g_per_kwh = mean(observed_ef_g_per_kwh),
+    predicted_mean_ef_g_per_kwh = mean(predicted_ef_g_per_kwh),
+    n_facilities = n_distinct(facility_id),
     .groups = "drop"
   ) %>%
   mutate(region = factor(region, levels = selected_regions)) %>%
   arrange(region, year)
 
-if (nrow(regional_rates) == 0) {
-  stop("No regional coal SO2 emission-rate observations were produced.")
+if (nrow(regional_efs) == 0) {
+  stop(
+    "No coal SO2 full-sample predictions matched the selected eGRID subregions."
+  )
 }
 
 write_csv(
-  regional_rates,
-  file.path(processed_dir, "Figure_S2_regional_coal_SO2_rates.csv")
+  regional_efs,
+  file.path(
+    processed_dir,
+    "Figure_S3_regional_fullsample_observed_predicted_EF_20260916.csv"
+  )
 )
 
-print(regional_rates, n = Inf)
+plot_data <- regional_efs %>%
+  pivot_longer(
+    cols = c(
+      observed_mean_ef_g_per_kwh,
+      predicted_mean_ef_g_per_kwh
+    ),
+    names_to = "series",
+    values_to = "mean_ef_g_per_kwh"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      observed_mean_ef_g_per_kwh = "Observed",
+      predicted_mean_ef_g_per_kwh = "Predicted"
+    ),
+    series = factor(series, levels = c("Observed", "Predicted"))
+  )
+
+message(
+  "Matched full-sample facilities by eGRID subregion:\n",
+  paste(
+    capture.output(
+      print(
+        fullsample_predictions %>%
+          count(region, name = "facility_year_rows") %>%
+          arrange(match(region, selected_regions)),
+        n = Inf
+      )
+    ),
+    collapse = "\n"
+  )
+)
+
+print(regional_efs, n = Inf)
 
 # ----------------------------------------------------------------
 # 8. Publication figure
 # ----------------------------------------------------------------
 
-fig_s2 <- ggplot(
-  regional_rates,
-  aes(x = year, y = so2_rate_lb_mmbtu, group = region)
+fig_s3 <- ggplot(
+  plot_data,
+  aes(
+    x = year,
+    y = mean_ef_g_per_kwh,
+    color = series,
+    linetype = series,
+    shape = series,
+    group = interaction(region, series)
+  )
 ) +
   geom_line(
-    color = "#1F4E79",
     linewidth = 0.85,
     lineend = "round"
   ) +
   geom_point(
-    color = "#1F4E79",
     size = 1.25,
-    shape = 16
+    stroke = 0.25
   ) +
   facet_wrap(
     ~ region,
@@ -506,7 +628,7 @@ fig_s2 <- ggplot(
     expand = expansion(mult = c(0, 0))
   ) +
   scale_y_continuous(
-    labels = label_number(accuracy = 0.1),
+    labels = label_number(accuracy = 0.01),
     limits = c(0, NA),
     breaks = function(limits) {
       b <- pretty(c(0, limits[2]), n = 4)
@@ -514,9 +636,21 @@ fig_s2 <- ggplot(
     },
     expand = expansion(mult = c(0, 0.08))
   ) +
+  scale_color_manual(
+    values = c(Observed = "#1F4E79", Predicted = "#D95F02")
+  ) +
+  scale_linetype_manual(
+    values = c(Observed = "solid", Predicted = "22")
+  ) +
+  scale_shape_manual(
+    values = c(Observed = 16, Predicted = 17)
+  ) +
   labs(
     x = "Year",
-    y = expression(SO[2]~"emission rate (lb MMBtu"^{-1}*")")
+    y = expression(SO[2]~"emission factor (g kWh"^{-1}*")"),
+    color = NULL,
+    linetype = NULL,
+    shape = NULL
   ) +
   theme_classic(base_size = 11, base_family = "sans") +
   theme(
@@ -540,45 +674,62 @@ fig_s2 <- ggplot(
     strip.text = element_text(
       size = 10, face = "bold", margin = margin(3, 3, 3, 3)
     ),
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.justification = "center",
+    legend.key.width = grid::unit(1.25, "cm"),
+    legend.margin = margin(0, 0, 3, 0),
     panel.spacing.x = grid::unit(0.65, "lines"),
     panel.spacing.y = grid::unit(0.70, "lines"),
     plot.margin = margin(7, 8, 7, 7)
   )
 
-print(fig_s2)
+print(fig_s3)
 
 # ----------------------------------------------------------------
 # 9. Save PDF, PNG, and TIFF
 # ----------------------------------------------------------------
 
-pdf_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.pdf")
-png_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.png")
-tiff_file <- file.path(output_dir, "Figure_S2_regional_coal_SO2_rates.tiff")
+pdf_file <- file.path(
+  output_dir,
+  "Figure_S3_fullsample_observed_predicted_EF_20260916.pdf"
+)
+png_file <- file.path(
+  output_dir,
+  "Figure_S3_fullsample_observed_predicted_EF_20260916.png"
+)
+tiff_file <- file.path(
+  output_dir,
+  "Figure_S3_fullsample_observed_predicted_EF_20260916.tiff"
+)
 
 ggsave(
-  pdf_file, fig_s2,
+  pdf_file, fig_s3,
   width = 7.4, height = 8.2, units = "in",
   device = cairo_pdf, bg = "white"
 )
 
 ggsave(
-  png_file, fig_s2,
+  png_file, fig_s3,
   width = 7.4, height = 8.2, units = "in",
   dpi = 600, type = "cairo", bg = "white"
 )
 
 ggsave(
-  tiff_file, fig_s2,
+  tiff_file, fig_s3,
   width = 7.4, height = 8.2, units = "in",
   dpi = 600, compression = "lzw", bg = "white"
 )
 
-message("Figure S2 PDF:  ", pdf_file)
-message("Figure S2 PNG:  ", png_file)
-message("Figure S2 TIFF: ", tiff_file)
-message("Figure S2 data: ", file.path(
-  processed_dir, "Figure_S2_regional_coal_SO2_rates.csv"
+message("Figure S3 PDF:  ", pdf_file)
+message("Figure S3 PNG:  ", png_file)
+message("Figure S3 TIFF: ", tiff_file)
+message("Figure S3 data: ", file.path(
+  processed_dir,
+  "Figure_S3_regional_fullsample_observed_predicted_EF_20260916.csv"
 ))
-message("Figure S2 selection: ", file.path(
-  processed_dir, "Figure_S2_subregion_selection.csv"
+message("Figure S3 selection: ", file.path(
+  processed_dir,
+  "Figure_S3_subregion_selection_fullsample_EF_20260916.csv"
 ))
+
