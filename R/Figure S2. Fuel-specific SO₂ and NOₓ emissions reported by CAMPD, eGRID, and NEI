@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Figure S1: full data preparation and inventory-agreement scatterplot
+# Figure S2: full data preparation and inventory-agreement scatterplot
 # Fuel-specific SO2 and NOx emissions from CAMPD, eGRID, and NEI
 #
 # This script:
