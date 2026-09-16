@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Figure 5: county contributions to national population-weighted
+# Supplementary figure: county contributions to national population-weighted
 # exposure from modeled coal PM2.5, 1940–1990
 #
 # (a) County-level contributions by analysis year
@@ -40,9 +40,9 @@ FIG5_DATA_DIR <- file.path(
   "pwe_outputs_decades_FULL_NOcap_NOwhite"
 )
 
-FIG5_COUNTY_FILE <- file.path(
+FIG5_COUNTY_FILES <- file.path(
   FIG5_DATA_DIR,
-  "county_pm25_pop_all_years.csv"
+  paste0("county_pm25_pop_", FIG5_YEARS, ".csv")
 )
 
 FIG5_OUT_DIR <- file.path(FIG5_BASE_DIR, "figures_revised")
@@ -58,16 +58,22 @@ FIG5_WIDTH <- 7.4
 FIG5_HEIGHT <- 8.0
 FIG5_DPI <- 600
 
-if (!file.exists(FIG5_COUNTY_FILE)) {
+missing_county_files <- FIG5_COUNTY_FILES[
+  !file.exists(FIG5_COUNTY_FILES)
+]
+
+if (length(missing_county_files) > 0) {
   stop(
-    "County PWE contribution file not found:\n",
-    FIG5_COUNTY_FILE,
-    "\nRun PWE_county_1940_1990_with_Fig2B.R first."
+    "County PWE contribution files not found:\n",
+    paste(missing_county_files, collapse = "\n")
   )
 }
 
-message("Figure 5 input: ", FIG5_COUNTY_FILE)
-message("Figure 5 output directory: ", FIG5_OUT_DIR)
+message(
+  "Reading county PWE contribution files:\n",
+  paste(FIG5_COUNTY_FILES, collapse = "\n")
+)
+message("Supplementary figure output directory: ", FIG5_OUT_DIR)
 
 # ------------------------------
 # 1. Helper functions
@@ -100,7 +106,11 @@ fig5_theme <- function(base_size = 10) {
 # 2. Read and validate county contribution data
 # ------------------------------
 
-fig5_county_dt <- fread(FIG5_COUNTY_FILE)
+fig5_county_dt <- rbindlist(
+  lapply(FIG5_COUNTY_FILES, fread),
+  use.names = TRUE,
+  fill = TRUE
+)
 
 required_columns <- c(
   "geoid", "year", "state_abbr", "county_name", "contrib_nat"
@@ -230,17 +240,25 @@ if (!is.finite(fig5_map_cap_scaled) || fig5_map_cap_scaled <= 0) {
 fig5_map_cap <- fig5_map_cap_scaled / 1e4
 fig5_map_sf$contrib_plot <- fig5_map_sf$contrib_nat * 1e4
 
-fig5_map_breaks_scaled <- unique(c(
-  0,
-  round(fig5_map_cap_scaled * 0.4, 1),
-  round(fig5_map_cap_scaled * 0.8, 1),
-  fig5_map_cap_scaled
-))
+# Place six breaks at equal visual intervals on the square-root color scale.
+# In data units, the breaks are therefore quadratic rather than equally spaced.
+fig5_map_breaks_scaled <- round(
+  fig5_map_cap_scaled *
+    (seq(from = 0, to = 1, length.out = 6)^2),
+  digits = 2
+)
 
-fig5_map_label_text <- format(
+fig5_map_label_text <- vapply(
   fig5_map_breaks_scaled,
-  trim = TRUE,
-  scientific = FALSE
+  function(x) {
+    format(
+      x,
+      trim = TRUE,
+      scientific = FALSE,
+      nsmall = 0
+    )
+  },
+  character(1)
 )
 fig5_map_label_text[length(fig5_map_label_text)] <- paste0(
   "phantom(0) >= ",
@@ -290,7 +308,7 @@ fig5_panel_a <- ggplot() +
       direction = "horizontal",
       title.position = "top",
       title.hjust = 0.5,
-      barwidth = unit(5.0, "cm"),
+      barwidth = unit(6.0, "cm"),
       barheight = unit(0.32, "cm"),
       ticks = TRUE
     )
@@ -410,7 +428,7 @@ fig5_bottom_grob <- gridExtra::arrangeGrob(
 )
 
 # ------------------------------
-# 7. Combine Figure 5
+# 7. Combine supplementary figure
 # ------------------------------
 
 fig5_combined_grob <- gridExtra::arrangeGrob(
@@ -428,9 +446,18 @@ grid::grid.draw(fig5_combined_grob)
 # 8. Save PDF, PNG, and TIFF
 # ------------------------------
 
-fig5_pdf_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.pdf")
-fig5_png_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.png")
-fig5_tiff_file <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions.tiff")
+fig5_pdf_file <- file.path(
+  FIG5_OUT_DIR,
+  "SI_county_PWE_sqrtuniform_20260916.pdf"
+)
+fig5_png_file <- file.path(
+  FIG5_OUT_DIR,
+  "SI_county_PWE_sqrtuniform_20260916.png"
+)
+fig5_tiff_file <- file.path(
+  FIG5_OUT_DIR,
+  "SI_county_PWE_sqrtuniform_20260916.tiff"
+)
 
 unlink(c(fig5_pdf_file, fig5_png_file, fig5_tiff_file))
 
@@ -470,7 +497,10 @@ if (capabilities("cairo")) {
 }
 
 if (!fig5_png_saved && fig5_pdf_saved && nzchar(Sys.which("pdftoppm"))) {
-  png_prefix <- file.path(FIG5_OUT_DIR, "Figure_5_county_PWE_contributions")
+  png_prefix <- file.path(
+    FIG5_OUT_DIR,
+    "SI_county_PWE_sqrtuniform_20260916"
+  )
   status <- system2(
     Sys.which("pdftoppm"),
     args = c(
@@ -507,8 +537,8 @@ if (capabilities("cairo")) {
 if (fig5_pdf_saved) message("PDF saved: ", normalizePath(fig5_pdf_file))
 if (fig5_png_saved) message("PNG saved: ", normalizePath(fig5_png_file))
 if (fig5_tiff_saved) message("TIFF saved: ", normalizePath(fig5_tiff_file))
-if (!fig5_pdf_saved) warning("Figure 5 PDF was not generated.")
-if (!fig5_png_saved) warning("Figure 5 PNG was not generated.")
-if (!fig5_tiff_saved) warning("Figure 5 TIFF was not generated.")
+if (!fig5_pdf_saved) warning("Supplementary figure PDF was not generated.")
+if (!fig5_png_saved) warning("Supplementary figure PNG was not generated.")
+if (!fig5_tiff_saved) warning("Supplementary figure TIFF was not generated.")
 
-message("Figure 5 outputs are located in: ", FIG5_OUT_DIR)
+message("Supplementary figure outputs are located in: ", FIG5_OUT_DIR)
