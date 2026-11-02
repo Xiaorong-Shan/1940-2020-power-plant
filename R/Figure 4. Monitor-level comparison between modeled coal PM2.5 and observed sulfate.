@@ -191,9 +191,8 @@ make_panel <- function(plot_data, year_label, panel_label) {
 
   # "rho" is written in ASCII to avoid the two-dot rendering problem.
   annotation_text <- sprintf(
-    "n = %d\nPearson r = %.2f\nSpearman rho = %.2f\nR\u00B2 = %.2f",
+    "n = %d\nSpearman rho = %.2f\nR\u00B2 = %.2f",
     metrics$n,
-    metrics$pearson_r,
     metrics$spearman_rho,
     metrics$r2
   )
@@ -354,3 +353,4 @@ if (png_created) {
 
 message("Statistics saved: ", normalizePath(OUTPUT_STATS))
 message("Figure 4 replot completed successfully.")
+
