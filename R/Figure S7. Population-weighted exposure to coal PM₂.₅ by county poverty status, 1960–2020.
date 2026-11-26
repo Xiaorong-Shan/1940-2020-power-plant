@@ -1,0 +1,127 @@
+#!/usr/bin/env Rscript
+# County poverty and modeled population-weighted coal PM2.5, 1960-2020.
+# On Hopper, source this script or run: Rscript County_Poverty_Coal_PWE.R
+# Optional: Rscript County_Poverty_Coal_PWE.R exposure_dir [USDA_csv] [output_dir]
+# The exposure inputs are the original Figure 3 county_pm25_pop_YEAR.csv tables.
+# Poverty classifications: USDA ERS Poverty Area Measures, December 2023 edition.
+# https://www.ers.usda.gov/data-products/poverty-area-measures
+main <- function() {
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) > 3L) stop("Expected: [exposure_dir] [USDA_csv] [output_dir]")
+  default_dir <- file.path("/scratch/xshan2/R_Code/disperseR/main/output",
+                           "pm25_decades_model.lm.cv_single_poly_proxy1999met",
+                           "figure3_county_1940_2020", "tables")
+  input_dir <- if (length(args)) args[1] else default_dir
+  out_dir <- if (length(args) >= 3L) args[3] else file.path(input_dir, "county_poverty_results")
+  years <- seq(1960L, 2020L, 10L)
+  files <- file.path(input_dir, sprintf("county_pm25_pop_%d.csv", years))
+  if (any(!file.exists(files))) stop("Missing Figure 3 input: ", paste(files[!file.exists(files)], collapse = ", "))
+
+  usda_name <- "poverty-area-measures-december-2023-edition.csv"
+  usda_path <- if (length(args) >= 2L) args[2] else file.path(input_dir, usda_name)
+  if (length(args) < 2L && !file.exists(usda_path)) {
+    usda_path <- tempfile(fileext = ".csv")
+    on.exit(unlink(usda_path), add = TRUE)
+    url <- paste0("https://www.ers.usda.gov/media/5043/", usda_name, "?v=84898")
+    status <- try(utils::download.file(url, usda_path, mode = "wb", quiet = TRUE), silent = TRUE)
+    if (inherits(status, "try-error") || status != 0L) {
+      stop("Place the USDA December 2023 CSV named ", usda_name, " in ", input_dir, " and rerun.")
+    }
+  }
+  if (!file.exists(usda_path)) stop("USDA CSV not found: ", usda_path)
+  fields <- c("HiPov60_c","HiPov70_c","HiPov80_c","HiPov90_c","HiPov00_c","HiPov0711_c","HiPov1721_c")
+  periods <- c("1959","1969","1979","1989","1999","2007-2011 ACS","2017-2021 ACS")
+  # The national ERS file contains tract rows with repeated county classifications.
+  # Read only the county fields and reduce identical records to one row per county.
+  headers <- names(read.csv(usda_path, nrows = 0, fileEncoding = "windows-1252"))
+  keep <- c("fips", fields)
+  if (!all(keep %in% headers)) stop("Use the December 2023 Poverty Area Measures CSV.")
+  col_types <- setNames(rep("NULL", length(headers)), headers)
+  col_types[keep] <- "integer"
+  poverty <- unique(read.csv(usda_path, colClasses = col_types, fileEncoding = "windows-1252"))
+  if (anyNA(poverty$fips) || anyDuplicated(poverty$fips)) stop("Conflicting or missing county identifiers in ERS input.")
+  poverty$geoid <- sprintf("%05d", poverty$fips)
+
+  one_year <- function(i) {
+    d <- read.csv(files[i], colClasses = c(geoid = "character"), stringsAsFactors = FALSE)
+    if (!all(c("geoid","year","pm25","population") %in% names(d))) stop("Missing Figure 3 columns in ", files[i])
+    if (anyNA(d$year) || !all(d$year == years[i]) || anyNA(d$geoid) || anyDuplicated(d$geoid)) stop("Invalid county/year records in ", files[i])
+    j <- match(d$geoid, poverty$geoid)
+    group <- poverty[[fields[i]]][j]
+    eligible <- is.finite(d$pm25) & is.finite(d$population) & d$population > 0
+    valid <- eligible & group %in% c(0L, 1L)  # ERS -1 = unclassified, including unreliable estimates
+    high <- valid & group %in% 1L
+    lower <- valid & group %in% 0L
+    if (!any(high) || !any(lower)) stop("Insufficient eligible groups in ", years[i])
+    weighted <- function(ix) weighted.mean(d$pm25[ix], w = d$population[ix])
+    a <- weighted(high)
+    b <- weighted(lower)
+    data.frame(year = years[i], poverty_reference_period = periods[i],
+               high_poverty_pwe = a, other_counties_pwe = b, difference_ug_m3 = a-b,
+               n_high = sum(high), n_other = sum(lower), population_high = sum(d$population[high]),
+               population_other = sum(d$population[lower]), n_exposure_rows = nrow(d),
+               n_without_valid_population_or_concentration = sum(!eligible),
+               n_unmatched_geoid = sum(is.na(j)), n_poverty_unknown_among_eligible = sum(eligible & !valid),
+               population_coverage_among_eligible = sum(d$population[valid])/sum(d$population[eligible]))
+  }
+  s <- do.call(rbind, lapply(seq_along(years), one_year))
+  if (!dir.exists(out_dir) && !dir.create(out_dir, recursive = TRUE)) stop("Cannot create ", out_dir)
+  write.csv(s, file.path(out_dir, "county_poverty_pwe.csv"), row.names = FALSE)
+
+  pdf_path <- file.path(out_dir, "county_poverty_pwe.pdf")
+  png_path <- file.path(out_dir, "county_poverty_pwe.png")
+  width <- 7.3
+  height <- 6.3
+  draw_figure <- function() {
+    layout(matrix(1:2, ncol = 1), heights = c(1.3, 1))
+    panel_label <- function(label) {
+      # Place the tag in the left margin, above the vertical axis title.
+      x <- grconvertX(0.03, from = "nfc", to = "user")
+      mtext(label, side = 3, at = x, adj = 0.5, line = 0.15, font = 1, xpd = NA)
+    }
+    par(mar = c(2.1, 4.8, 1.8, 1.2), mgp = c(2.8, 0.8, 0), las = 1)
+    high_col <- "#a74328"
+    lower_col <- "#24618a"
+    plot(s$year, s$high_poverty_pwe, type = "n", xaxt = "n",
+         ylim = c(0, max(s$high_poverty_pwe, s$other_counties_pwe)*1.08),
+         xlab = "", ylab = expression("Coal PM"[2.5]*" ("*mu*"g "*m^{-3}*")"), bty = "l")
+    axis(1, at = years, labels = FALSE)
+    panel_label("(a)")
+    lines(s$year, s$high_poverty_pwe, type = "o", pch = 16, lwd = 1.7, col = high_col)
+    lines(s$year, s$other_counties_pwe, type = "o", pch = 1, lty = 2, lwd = 1.7, col = lower_col)
+    legend("topleft", c("County poverty rate 20% or higher", "County poverty rate below 20%"),
+           col = c(high_col, lower_col), lty = c(1,2), pch = c(16,1), lwd = 1.7, bty = "n", cex = 0.88)
+    par(mar = c(5.5, 4.8, 1.4, 1.2))
+    plot(s$year, s$difference_ug_m3, type = "n", xaxt = "n", xlab = "Study year",
+         ylab = expression("Difference ("*mu*"g "*m^{-3}*")"),
+         ylim = extendrange(range(0, s$difference_ug_m3), f = 0.12), bty = "l")
+    axis(1, at = years, labels = years)
+    abline(h = 0, col = "grey60", lty = 2)
+    lines(s$year, s$difference_ug_m3, type = "o", pch = 16, col = "#343c49", lwd = 1.5)
+    panel_label("(b)")
+  }
+
+  pdf(pdf_path, width = width, height = height, pointsize = 10, useDingbats = FALSE)
+  tryCatch(draw_figure(), finally = dev.off())
+
+  # Rasterize the same page, including its bottom margin, at print resolution.
+  png_tmp <- tempfile("county_poverty_", tmpdir = out_dir, fileext = ".png")
+  on.exit(unlink(png_tmp), add = TRUE)
+  converters <- Sys.which(c("pdftocairo", "pdftoppm"))
+  for (program in converters[nzchar(converters)]) {
+    status <- system2(program, c("-png", "-singlefile", "-r", "600",
+                                 shQuote(pdf_path), shQuote(tools::file_path_sans_ext(png_tmp))))
+    if (status == 0L && file.exists(png_tmp) && file.size(png_tmp) > 0) break
+    unlink(png_tmp)
+  }
+  if (!file.exists(png_tmp)) {
+    if (!capabilities("cairo")) stop("PNG export requires pdftocairo, pdftoppm, or R Cairo graphics.")
+    png(png_tmp, width = width, height = height, units = "in", res = 600,
+        pointsize = 10, type = "cairo", bg = "white")
+    tryCatch(draw_figure(), finally = dev.off())
+  }
+  if (!file.rename(png_tmp, png_path)) stop("Could not save PNG: ", png_path)
+  print(s[c("year","high_poverty_pwe","other_counties_pwe","difference_ug_m3")], row.names = FALSE)
+  message("Results: ", normalizePath(out_dir))
+}
+main()
