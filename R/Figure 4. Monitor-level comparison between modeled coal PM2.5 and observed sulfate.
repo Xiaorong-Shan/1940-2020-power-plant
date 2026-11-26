@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Figure 4: monitor-level comparison of modeled coal PM2.5
+# Figure 4. Regional Spearman correlations in 1980 and 1990.
 # against observed sulfate in 1980 and 1990
 #
 # This script uses the previously matched monitor-level CSV files.
@@ -9,348 +9,208 @@
 # not require Cairo graphics.
 # ================================================================
 
-rm(list = ls(all.names = TRUE))
-graphics.off()
-
-suppressPackageStartupMessages({
-  library(data.table)
-  library(ggplot2)
-  library(grid)
-  library(gridExtra)
-})
-
-# ------------------------------
-# 0. Settings
-# ------------------------------
-
-PROJECT_DIR <- "/scratch/xshan2/R_Code/disperseR/main"
-
-MODEL_DIR <- file.path(
-  PROJECT_DIR,
-  "output",
-  "pm25_decades_model.lm.cv_single_poly_proxy1999met"
-)
-
 FIGURE_DIR <- file.path(
-  MODEL_DIR,
-  "evaluation",
-  "aqs_hyads_eval_figure4"
+  "/scratch/xshan2/R_Code/disperseR/main/output",
+  "pm25_decades_model.lm.cv_single_poly_proxy1999met",
+  "evaluation", "aqs_hyads_eval_figure4"
 )
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 2L) stop("Usage: Rscript Figure4_Map_Labeled.R [input_directory] [output_directory]")
+input_dir <- if (length(args) >= 1L) args[1] else FIGURE_DIR
+output_dir <- if (length(args) == 2L) args[2] else input_dir
+years <- c(1980L, 1990L)
+files <- file.path(input_dir, sprintf("Figure4_matched_monitor_data_%d.csv", years))
+if (any(!file.exists(files))) stop("Missing matched-monitor CSV: ", paste(files[!file.exists(files)], collapse = ", "))
+if (!requireNamespace("maps", quietly = TRUE)) stop("The R package 'maps' is required for the state outlines.")
+if (!dir.exists(output_dir) && !dir.create(output_dir, recursive = TRUE)) stop("Cannot create ", output_dir)
 
-FIGURE_WIDTH_IN <- 7.4
-FIGURE_HEIGHT_IN <- 3.8
-FIGURE_DPI <- 600
-
-MATCHED_FILES <- list(
-  `1980` = file.path(
-    FIGURE_DIR,
-    "Figure4_matched_monitor_data_1980.csv"
-  ),
-  `1990` = file.path(
-    FIGURE_DIR,
-    "Figure4_matched_monitor_data_1990.csv"
-  )
+# US Census Bureau regions for the contiguous United States and DC, by state FIPS.
+# https://www2.census.gov/geo/pdfs/maps-data/maps/reference/us_regdiv.pdf
+region_fips <- list(
+  West      = c("04","06","08","16","30","32","35","41","49","53","56"),
+  Midwest   = c("17","18","19","20","26","27","29","31","38","39","46","55"),
+  South     = c("01","05","10","11","12","13","21","22","24","28","37","40","45","47","48","51","54"),
+  Northeast = c("09","23","25","33","34","36","42","44","50")
 )
+region_by_fips <- setNames(rep(names(region_fips), lengths(region_fips)), unlist(region_fips, use.names = FALSE))
 
-OUTPUT_PDF <- file.path(
-  FIGURE_DIR,
-  "Figure4_AQS_sulfate_plainpdf_20260916.pdf"
-)
-
-OUTPUT_PNG <- file.path(
-  FIGURE_DIR,
-  "Figure4_AQS_sulfate_plainpdf_20260916.png"
-)
-
-OUTPUT_STATS <- file.path(
-  FIGURE_DIR,
-  "Figure4_AQS_sulfate_statistics_20260916.csv"
-)
-
-dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
-
-missing_files <- unlist(MATCHED_FILES)[
-  !file.exists(unlist(MATCHED_FILES))
-]
-
-if (length(missing_files) > 0L) {
-  stop(
-    "Missing matched-monitor files:\n",
-    paste(missing_files, collapse = "\n")
-  )
-}
-
-message("Reading matched data from: ", FIGURE_DIR)
-
-# ------------------------------
-# 1. Read matched monitor data
-# ------------------------------
-
-read_matched_data <- function(file_path, analysis_year) {
-  dt <- data.table::fread(file_path)
-
-  required_columns <- c("observed", "modeled")
-  missing_columns <- setdiff(required_columns, names(dt))
-
-  if (length(missing_columns) > 0L) {
-    stop(
-      basename(file_path),
-      " is missing required columns: ",
-      paste(missing_columns, collapse = ", ")
-    )
+read_sites <- function(path, study_year) {
+  d <- read.csv(path, colClasses = c(site_id = "character"), stringsAsFactors = FALSE)
+  required <- c("site_id", "year", "longitude", "latitude", "observed", "modeled")
+  if (!all(required %in% names(d))) stop(basename(path), " is missing: ", paste(setdiff(required, names(d)), collapse = ", "))
+  if (anyNA(d$year) || !all(d$year == study_year)) stop("Year mismatch in ", basename(path))
+  keep <- is.finite(d$observed) & is.finite(d$modeled)
+  if (any(!keep)) message(study_year, ": excluding ", sum(!keep), " nonfinite concentration pairs")
+  d <- d[keep, required, drop = FALSE]
+  if (!all(grepl("^[0-9]{2}_[0-9]{3}_[0-9]{4}$", d$site_id)) || anyNA(d$site_id) || anyDuplicated(d$site_id)) {
+    stop("Expected one unique AQS site ID per row (SS_CCC_NNNN) in ", basename(path))
   }
+  d$region <- unname(region_by_fips[substr(d$site_id, 1L, 2L)])
+  if (anyNA(d$region)) stop("Site with an unassigned state FIPS in ", basename(path))
+  if (any(!is.finite(d$longitude) | !is.finite(d$latitude))) stop("Missing map coordinates in ", basename(path))
+  d
+}
+sites <- do.call(rbind, Map(read_sites, files, years))
 
-  dt[, observed := as.numeric(observed)]
-  dt[, modeled := as.numeric(modeled)]
-  dt <- dt[is.finite(observed) & is.finite(modeled)]
-
-  if (nrow(dt) < 3L) {
-    stop(
-      "Fewer than three valid matched monitors were found for ",
-      analysis_year,
-      "."
-    )
+# A single matched pair per site-year; average ranks for ties.
+regions <- names(region_fips)
+regional_rho <- matrix(NA_real_, nrow = length(regions), ncol = length(years),
+                       dimnames = list(regions, as.character(years)))
+for (yr in years) {
+  for (region in regions) {
+    d <- sites[sites$year == yr & sites$region == region, ]
+    if (nrow(d) >= 3L && length(unique(d$observed)) > 1L && length(unique(d$modeled)) > 1L) {
+      regional_rho[region, as.character(yr)] <- cor(d$observed, d$modeled, method = "spearman")
+    }
   }
-
-  dt[, year := as.integer(analysis_year)]
-  dt
 }
 
-matched_data <- list(
-  `1980` = read_matched_data(MATCHED_FILES[["1980"]], 1980L),
-  `1990` = read_matched_data(MATCHED_FILES[["1990"]], 1990L)
-)
-
-message("1980 matched monitors: ", nrow(matched_data[["1980"]]))
-message("1990 matched monitors: ", nrow(matched_data[["1990"]]))
-
-# ------------------------------
-# 2. Calculate validation statistics
-# ------------------------------
-
-calculate_metrics <- function(observed, modeled) {
-  valid <- is.finite(observed) & is.finite(modeled)
-  observed <- observed[valid]
-  modeled <- modeled[valid]
-
-  if (length(observed) < 3L) {
-    stop("Fewer than three valid observed-modeled pairs.")
+# NAD83 / Conus Albers (EPSG:5070), ellipsoidal Albers equations (GRS 1980).
+# Treat the geographic site coordinates as NAD83 for plotting at CONUS scale.
+project_figure4_sites <- function(longitude, latitude) {
+  rad <- pi / 180
+  a <- 6378137
+  flattening <- 1 / 298.257222101
+  e2 <- flattening * (2 - flattening)
+  e <- sqrt(e2)
+  q <- function(phi) {
+    s <- sin(phi)
+    (1 - e2) * (s / (1 - e2 * s^2) - log((1 - e*s) / (1 + e*s)) / (2*e))
   }
-
-  pearson_r <- suppressWarnings(
-    stats::cor(observed, modeled, method = "pearson")
-  )
-
-  spearman_rho <- suppressWarnings(
-    stats::cor(observed, modeled, method = "spearman")
-  )
-
-  list(
-    n = length(observed),
-    mean_observed = mean(observed),
-    mean_modeled = mean(modeled),
-    mean_bias = mean(modeled - observed),
-    mae = mean(abs(modeled - observed)),
-    rmse = sqrt(mean((modeled - observed)^2)),
-    pearson_r = pearson_r,
-    spearman_rho = spearman_rho,
-    r2 = pearson_r^2
-  )
+  parallels <- c(29.5, 45.5) * rad
+  m2 <- cos(parallels)^2 / (1 - e2 * sin(parallels)^2)
+  qp <- q(parallels)
+  n <- (m2[1] - m2[2]) / (qp[2] - qp[1])
+  C <- m2[1] + n * qp[1]
+  radius <- function(phi) a * sqrt(C - n * q(phi)) / n
+  angle <- n * (longitude + 96) * rad
+  r <- radius(latitude * rad)
+  data.frame(x = r * sin(angle), y = radius(23 * rad) - r * cos(angle))
 }
 
-statistics_by_year <- data.table::rbindlist(
-  lapply(names(matched_data), function(year_text) {
-    dt <- matched_data[[year_text]]
-    metrics <- calculate_metrics(dt$observed, dt$modeled)
+# State outlines come from the installed maps package. The site values come from the CSVs.
+outline <- maps::map("state", fill = TRUE, plot = FALSE)
+state_region <- setNames(as.character(state.region), tolower(state.name))
+state_region[state_region == "North Central"] <- "Midwest"
+state_region["district of columbia"] <- "South"
+polygon_region <- unname(state_region[sub(":.*$", "", outline$names)])
+if (anyNA(polygon_region)) stop("Unrecognized state outline in maps::map('state').")
+polygon_id <- cumsum(c(TRUE, is.na(head(outline$x, -1L))))
+polygon_xy <- project_figure4_sites(outline$x, outline$y)
+keep_vertex <- is.finite(polygon_xy$x) & is.finite(polygon_xy$y)
+polygons <- split(polygon_xy[keep_vertex, ], polygon_id[keep_vertex])
+stopifnot(length(polygons) == length(polygon_region))
+site_xy <- project_figure4_sites(sites$longitude, sites$latitude)
 
-    data.table::data.table(
-      year = as.integer(year_text),
-      n = metrics$n,
-      mean_observed = metrics$mean_observed,
-      mean_modeled = metrics$mean_modeled,
-      mean_bias = metrics$mean_bias,
-      mae = metrics$mae,
-      rmse = metrics$rmse,
-      pearson_r = metrics$pearson_r,
-      spearman_rho = metrics$spearman_rho,
-      r2 = metrics$r2
-    )
-  })
+# Draw the outer border of each Census region with a slightly heavier line.
+state_names <- sub(":.*$", "", outline$names)
+region_borders <- lapply(regions, function(region) {
+  pattern <- paste0("^", unique(state_names[polygon_region == region]), "(:|$)")
+  border <- maps::map("state", regions = pattern, interior = FALSE, plot = FALSE)
+  project_figure4_sites(border$x, border$y)
+})
+palette <- grDevices::colorRampPalette(
+  c("#aa4821", "#e4aa85", "#faf8f3", "#8cc3d2", "#126380"), space = "Lab"
+)(201L)
+region_color <- function(value) {
+  ifelse(is.finite(value), palette[1L + round(100 * (1 + pmin(1, pmax(-1, value))))], "#bdbdbd")
+}
+
+# Shared geographic anchors keep the labels in the same places in both years.
+# The Northeast label sits offshore, with a leader to the region.
+label_points <- data.frame(
+  region = c("West", "Midwest", "South", "Northeast"),
+  longitude = c(-117.0, -100.2, -92.3, -70.25),
+  latitude = c(39.6, 44.1, 35.7, 39.6)
 )
+label_xy <- project_figure4_sites(label_points$longitude, label_points$latitude)
+northeast_tip <- project_figure4_sites(-72.3, 41.6)
 
-data.table::setorder(statistics_by_year, year)
-data.table::fwrite(statistics_by_year, OUTPUT_STATS)
-print(statistics_by_year)
-
-# ------------------------------
-# 3. Create each panel
-# ------------------------------
-
-make_panel <- function(plot_data, year_label, panel_label) {
-  metrics <- calculate_metrics(plot_data$observed, plot_data$modeled)
-
-  # "rho" is written in ASCII to avoid the two-dot rendering problem.
-  annotation_text <- sprintf(
-    "n = %d\nSpearman rho = %.2f\nR\u00B2 = %.2f",
-    metrics$n,
-    metrics$spearman_rho,
-    metrics$r2
-  )
-
-  ggplot2::ggplot(
-    plot_data,
-    ggplot2::aes(x = observed, y = modeled)
-  ) +
-    ggplot2::geom_point(
-      color = "black",
-      alpha = 0.45,
-      size = 1.3
-    ) +
-    ggplot2::geom_smooth(
-      method = "lm",
-      formula = y ~ x,
-      se = FALSE,
-      color = "#3568D4",
-      size = 0.9
-    ) +
-    ggplot2::annotate(
-      "text",
-      x = Inf,
-      y = Inf,
-      label = annotation_text,
-      hjust = 1.05,
-      vjust = 1.12,
-      size = 3.2,
-      lineheight = 0.95
-    ) +
-    ggplot2::scale_x_continuous(
-      expand = ggplot2::expansion(mult = c(0.02, 0.04))
-    ) +
-    ggplot2::scale_y_continuous(
-      expand = ggplot2::expansion(mult = c(0.03, 0.06))
-    ) +
-    ggplot2::labs(
-      tag = panel_label,
-      title = year_label,
-      x = expression(
-        "Annual mean observed sulfate (" * mu * "g " * m^{-3} * ")"
-      ),
-      y = expression(
-        "Annual mean modeled coal PM"[2.5] *
-          " (" * mu * "g " * m^{-3} * ")"
-      )
-    ) +
-    ggplot2::theme_bw(base_size = 10, base_family = "sans") +
-    ggplot2::theme(
-      text = ggplot2::element_text(color = "black"),
-      plot.title = ggplot2::element_text(
-        size = 11,
-        face = "bold",
-        hjust = 0.5,
-        margin = ggplot2::margin(b = 4)
-      ),
-      plot.tag = ggplot2::element_text(size = 11, face = "bold"),
-      plot.tag.position = c(0.015, 0.985),
-      axis.title = ggplot2::element_text(size = 9.5),
-      axis.text = ggplot2::element_text(size = 8.5, color = "black"),
-      axis.ticks = ggplot2::element_line(color = "black", size = 0.35),
-      panel.grid.major = ggplot2::element_line(
-        color = "grey88",
-        size = 0.3
-      ),
-      panel.grid.minor = ggplot2::element_blank(),
-      panel.border = ggplot2::element_rect(
-        color = "grey35",
-        fill = NA,
-        size = 0.45
-      ),
-      plot.margin = ggplot2::margin(8, 8, 6, 8)
-    )
+draw_map <- function(year, label) {
+  selected <- sites$year == year
+  rho <- regional_rho[, as.character(year)]
+  par(mar = c(0, 0.1, 1.6, 0.1))
+  plot.new()
+  plot.window(c(-2440000, 2340000), c(200000, 3220000),
+              asp = 1, xaxs = "i", yaxs = "i")
+  for (i in seq_along(polygons)) {
+    p <- polygons[[i]]
+    polygon(p$x, p$y, col = region_color(rho[polygon_region[i]]), border = "#889398", lwd = 0.34)
+  }
+  for (border in region_borders) lines(border$x, border$y, col = "#626c70", lwd = 0.58)
+  points(site_xy$x[selected], site_xy$y[selected], pch = 16, cex = 0.29, col = "#29343cc0")
+  label_values <- rho[label_points$region]
+  label_text <- ifelse(is.finite(label_values), sprintf("%.2f", label_values), "NA")
+  northeast <- match("Northeast", label_points$region)
+  segments(northeast_tip$x, northeast_tip$y,
+           label_xy$x[northeast], label_xy$y[northeast] + strheight("0", cex = 0.92) * 0.8,
+           col = "#516069", lwd = 0.65)
+  text(label_xy$x, label_xy$y, labels = label_text, font = 2, cex = 0.92, col = "#152b37")
+  mtext(sprintf("(%s)  %d", label, year), side = 3, adj = 0.035, line = 0.27, font = 2)
+  mtext(sprintf("n = %d", sum(selected)), side = 3, adj = 0.96, line = 0.27, cex = 0.91)
 }
 
-panel_1980 <- make_panel(
-  matched_data[["1980"]],
-  year_label = "1980",
-  panel_label = "(a)"
-)
-
-panel_1990 <- make_panel(
-  matched_data[["1990"]],
-  year_label = "1990",
-  panel_label = "(b)"
-)
-
-combined_figure <- gridExtra::arrangeGrob(
-  panel_1980,
-  grid::nullGrob(),
-  panel_1990,
-  ncol = 3,
-  widths = c(1, 0.05, 1)
-)
-
-# ------------------------------
-# 4. Save with the standard PDF device
-# ------------------------------
-
-if (file.exists(OUTPUT_PDF)) {
-  unlink(OUTPUT_PDF)
+draw_key <- function() {
+  par(mar = rep(0, 4))
+  plot.new()
+  plot.window(c(0, 1), c(0, 1), xaxs = "i", yaxs = "i")
+  text(0.305, 0.69, expression("Spearman"~rho), adj = 1, cex = 0.91)
+  left <- 0.33
+  right <- 0.67
+  rasterImage(as.raster(matrix(palette, nrow = 1L)), left, 0.60, right, 0.80, interpolate = TRUE)
+  rect(left, 0.60, right, 0.80, border = "#77848a", lwd = 0.45)
+  ticks <- seq(left, right, length.out = 5L)
+  segments(ticks, 0.60, ticks, 0.53, col = "#77848a", lwd = 0.45)
+  text(ticks, 0.29, c("-1", "-0.5", "0", "0.5", "1"), cex = 0.80)
+  points(0.75, 0.70, pch = 16, cex = 0.62, col = "#29343c")
+  text(0.765, 0.70, "Monitoring site", adj = 0, cex = 0.86)
+  if (anyNA(regional_rho)) {
+    rect(0.742, 0.17, 0.755, 0.36, col = "#bdbdbd", border = "#788388", lwd = 0.45)
+    text(0.765, 0.26, "Not estimated", adj = 0, cex = 0.86)
+  }
 }
 
-grDevices::pdf(
-  file = OUTPUT_PDF,
-  width = FIGURE_WIDTH_IN,
-  height = FIGURE_HEIGHT_IN,
-  onefile = TRUE,
-  useDingbats = FALSE,
-  paper = "special",
-  bg = "white"
-)
-
-grid::grid.newpage()
-grid::grid.draw(combined_figure)
-invisible(grDevices::dev.off())
-
-if (!file.exists(OUTPUT_PDF) || file.info(OUTPUT_PDF)$size <= 0L) {
-  stop("The PDF file was not created successfully: ", OUTPUT_PDF)
+render <- function() {
+  layout(matrix(c(1L, 2L, 3L, 3L), nrow = 2L, byrow = TRUE), heights = c(2.6, 0.45))
+  par(family = "sans", cex = 1, col = "#24313b", col.axis = "#24313b")
+  draw_map(1980L, "a")
+  draw_map(1990L, "b")
+  draw_key()
 }
 
-message("PDF saved: ", normalizePath(OUTPUT_PDF))
-
-# ------------------------------
-# 5. Create PNG from the PDF when pdftoppm is available
-# ------------------------------
-
-png_created <- FALSE
-pdftoppm_command <- Sys.which("pdftoppm")
-
-if (nzchar(pdftoppm_command)) {
-  png_prefix <- sub("\\.png$", "", OUTPUT_PNG)
-
-  conversion_status <- system2(
-    pdftoppm_command,
-    args = c(
-      "-png",
-      "-r",
-      as.character(FIGURE_DPI),
-      "-singlefile",
-      shQuote(OUTPUT_PDF),
-      shQuote(png_prefix)
-    )
-  )
-
-  png_created <- identical(conversion_status, 0L) &&
-    file.exists(OUTPUT_PNG) &&
-    file.info(OUTPUT_PNG)$size > 0L
+save_figure <- function(output_dir) {
+  pdf_file <- file.path(output_dir, "Figure4_regional_Spearman_map_labeled.pdf")
+  png_file <- file.path(output_dir, "Figure4_regional_Spearman_map_labeled.png")
+  width <- 7.4
+  height <- 3.05
+  grDevices::pdf(pdf_file, width = width, height = height, pointsize = 9.5,
+                 family = "Helvetica", useDingbats = FALSE, paper = "special")
+  tryCatch(render(), finally = grDevices::dev.off())
+  final_pdf <- normalizePath(pdf_file, mustWork = TRUE)
+  prefix <- tempfile("regional_figure4_")
+  tmp_png <- paste0(prefix, ".png")
+  on.exit(unlink(tmp_png), add = TRUE)
+  for (program in c("pdftocairo", "pdftoppm")) {
+    converter <- Sys.which(program)
+    if (!nzchar(converter)) next
+    status <- system2(converter, c("-png", "-singlefile", "-r", "600",
+                                   shQuote(final_pdf), shQuote(prefix)))
+    if (status == 0L && file.exists(tmp_png) && file.info(tmp_png)$size > 0) break
+    unlink(tmp_png)
+  }
+  if (!file.exists(tmp_png) && capabilities("cairo")) {
+    grDevices::png(tmp_png, width = width, height = height, units = "in", res = 600,
+                   type = "cairo", pointsize = 9.5)
+    tryCatch(render(), finally = grDevices::dev.off())
+  }
+  if (file.exists(tmp_png) && file.info(tmp_png)$size > 0) {
+    if (!file.copy(tmp_png, png_file, overwrite = TRUE)) stop("Unable to save PNG: ", png_file)
+  } else {
+    message("PDF saved. To also export PNG, make pdftocairo or pdftoppm available and rerun.")
+  }
+  message("Figure saved: ", final_pdf)
+  if (file.exists(tmp_png)) message("Figure saved: ", normalizePath(png_file))
+  invisible(NULL)
 }
 
-if (png_created) {
-  message("PNG saved: ", normalizePath(OUTPUT_PNG))
-} else {
-  message(
-    "PNG was not created because pdftoppm is unavailable or conversion failed."
-  )
-}
-
-message("Statistics saved: ", normalizePath(OUTPUT_STATS))
-message("Figure 4 replot completed successfully.")
-
+save_figure(output_dir)
